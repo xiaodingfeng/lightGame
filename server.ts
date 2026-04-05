@@ -37,10 +37,19 @@ type StoredUser = {
   app_id: string | null;
 };
 
-const MINI_GAME_APP_ID = process.env.DOUYIN_APP_ID || 'ttd4a0a21d4ac66d7702';
+const MINI_GAME_APP_ID =
+  process.env.DOUYIN_APP_ID ||
+  process.env.APP_ID ||
+  process.env.TT_APP_ID ||
+  'ttd4a0a21d4ac66d7702';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
-const DOUYIN_APP_SECRET = process.env.DOUYIN_APP_SECRET || '';
-const DOUYIN_PAY_SALT = process.env.DOUYIN_PAY_SALT || '';
+const DOUYIN_APP_SECRET =
+  process.env.DOUYIN_APP_SECRET ||
+  process.env.APP_SECRET ||
+  process.env.APPSECREAT ||
+  process.env.DOUYIN_APPSECREAT ||
+  '';
+const DOUYIN_PAY_SALT = process.env.DOUYIN_PAY_SALT || process.env.PAY_SALT || '';
 const IS_CLOUD = process.env.DOUYIN_CLOUD === 'true';
 const DEFAULT_PORT = IS_CLOUD ? '8000' : '3000';
 const PORT = Number.parseInt(process.env.PORT || DEFAULT_PORT, 10);
@@ -627,6 +636,7 @@ async function startServer() {
     console.log(`[server] light-refraction-server listening on 0.0.0.0:${PORT} (${IS_DEV ? 'dev' : 'production'})`);
     console.log(`[server] static directory: ${PUBLIC_DIR}`);
     console.log(`[server] mini game appId: ${MINI_GAME_APP_ID}`);
+    console.log(`[server] app secret set: ${DOUYIN_APP_SECRET ? 'yes' : 'no'}, pay salt set: ${DOUYIN_PAY_SALT ? 'yes' : 'no'}`);
     if (IS_CLOUD) {
       console.log('[server] running in Douyin Cloud compatible mode');
     }

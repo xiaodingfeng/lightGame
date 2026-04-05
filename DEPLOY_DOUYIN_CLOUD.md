@@ -23,6 +23,14 @@
 - `PORT=8000`
 - `DB_PATH=/data/database.sqlite`
 
+兼容别名：
+
+- `APP_ID` 或 `TT_APP_ID` 也可作为 `DOUYIN_APP_ID`
+- `APP_SECRET`、`APPSECREAT`、`DOUYIN_APPSECREAT` 也可作为 `DOUYIN_APP_SECRET`
+- `PAY_SALT` 也可作为 `DOUYIN_PAY_SALT`
+
+容器启动日志会打印变量摘要，不会打印密钥原文。
+
 ## 本地验证
 
 ```bash
