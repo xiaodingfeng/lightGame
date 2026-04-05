@@ -3,6 +3,22 @@ import path from 'node:path';
 import { open } from 'sqlite';
 import sqlite3 from 'sqlite3';
 
+async function addColumnIfMissing(db: Awaited<ReturnType<typeof open>>, table: string, column: string, definition: string) {
+  const columns = await db.all<{ name: string }[]>(`PRAGMA table_info(${table})`);
+  if (columns.some((item) => item.name === column)) {
+    return;
+  }
+  await db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+async function createIndexIfMissing(db: Awaited<ReturnType<typeof open>>, name: string, sql: string) {
+  const index = await db.get<{ name: string }>('SELECT name FROM sqlite_master WHERE type = ? AND name = ?', ['index', name]);
+  if (index) {
+    return;
+  }
+  await db.exec(sql);
+}
+
 export async function initDb() {
   const preferCloudStorage =
     process.env.DOUYIN_CLOUD === 'true' || process.env.NODE_ENV === 'production';
@@ -22,8 +38,21 @@ export async function initDb() {
   await db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
-      openid TEXT UNIQUE NOT NULL,
+      openid TEXT UNIQUE,
+      anonymous_openid TEXT UNIQUE,
+      unionid TEXT,
       is_vip BOOLEAN NOT NULL DEFAULT 0,
+      auth_type TEXT NOT NULL DEFAULT 'anonymous',
+      app_id TEXT,
+      session_key TEXT,
+      nickname TEXT,
+      avatar_url TEXT,
+      profile_authorized BOOLEAN NOT NULL DEFAULT 0,
+      profile_verified BOOLEAN NOT NULL DEFAULT 0,
+      profile_payload TEXT,
+      profile_raw_data TEXT,
+      last_login_at DATETIME,
+      last_profile_at DATETIME,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
@@ -64,6 +93,22 @@ export async function initDb() {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
   `);
+
+  await addColumnIfMissing(db, 'users', 'anonymous_openid', 'TEXT');
+  await addColumnIfMissing(db, 'users', 'unionid', 'TEXT');
+  await addColumnIfMissing(db, 'users', 'auth_type', "TEXT NOT NULL DEFAULT 'anonymous'");
+  await addColumnIfMissing(db, 'users', 'app_id', 'TEXT');
+  await addColumnIfMissing(db, 'users', 'session_key', 'TEXT');
+  await addColumnIfMissing(db, 'users', 'nickname', 'TEXT');
+  await addColumnIfMissing(db, 'users', 'avatar_url', 'TEXT');
+  await addColumnIfMissing(db, 'users', 'profile_authorized', 'BOOLEAN NOT NULL DEFAULT 0');
+  await addColumnIfMissing(db, 'users', 'profile_verified', 'BOOLEAN NOT NULL DEFAULT 0');
+  await addColumnIfMissing(db, 'users', 'profile_payload', 'TEXT');
+  await addColumnIfMissing(db, 'users', 'profile_raw_data', 'TEXT');
+  await addColumnIfMissing(db, 'users', 'last_login_at', 'DATETIME');
+  await addColumnIfMissing(db, 'users', 'last_profile_at', 'DATETIME');
+  await createIndexIfMissing(db, 'idx_users_openid_unique', 'CREATE UNIQUE INDEX idx_users_openid_unique ON users(openid)');
+  await createIndexIfMissing(db, 'idx_users_anonymous_openid_unique', 'CREATE UNIQUE INDEX idx_users_anonymous_openid_unique ON users(anonymous_openid)');
 
   console.log('[db] initialized');
   return db;

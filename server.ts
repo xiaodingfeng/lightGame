@@ -9,14 +9,36 @@ type JwtUser = {
   id: string;
   openid: string;
   is_vip: boolean;
+  auth_type: 'login' | 'anonymous';
 };
 
 type AuthedRequest = Request & {
   user?: JwtUser;
 };
 
+type SessionResult = {
+  openid?: string;
+  anonymous_openid?: string;
+  unionid?: string;
+  session_key?: string;
+};
+
+type StoredUser = {
+  id: string;
+  openid: string | null;
+  anonymous_openid: string | null;
+  unionid: string | null;
+  auth_type: 'login' | 'anonymous';
+  is_vip: number;
+  nickname: string | null;
+  avatar_url: string | null;
+  profile_authorized: number;
+  profile_verified: number;
+  app_id: string | null;
+};
+
+const MINI_GAME_APP_ID = process.env.DOUYIN_APP_ID || 'ttd4a0a21d4ac66d7702';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
-const DOUYIN_APP_ID = process.env.DOUYIN_APP_ID || '';
 const DOUYIN_APP_SECRET = process.env.DOUYIN_APP_SECRET || '';
 const DOUYIN_PAY_SALT = process.env.DOUYIN_PAY_SALT || '';
 const IS_CLOUD = process.env.DOUYIN_CLOUD === 'true';
@@ -34,15 +56,64 @@ function generatePaySign(params: Record<string, unknown>): string {
   return crypto.createHash('md5').update(signStr, 'utf8').digest('hex');
 }
 
-async function fetchOpenId(code: string): Promise<string> {
+function maskValue(value?: string | null) {
+  if (!value) {
+    return '';
+  }
+  if (value.length <= 8) {
+    return value;
+  }
+  return `${value.slice(0, 4)}***${value.slice(-4)}`;
+}
+
+function buildUserResponse(user: StoredUser) {
+  return {
+    id: user.id,
+    isVip: !!user.is_vip,
+    authType: user.auth_type,
+    hasOpenId: !!user.openid,
+    hasAnonymousOpenId: !!user.anonymous_openid,
+    openIdMasked: maskValue(user.openid),
+    anonymousOpenIdMasked: maskValue(user.anonymous_openid),
+    unionIdMasked: maskValue(user.unionid),
+    appId: user.app_id || MINI_GAME_APP_ID,
+    profileAuthorized: !!user.profile_authorized,
+    profileVerified: !!user.profile_verified,
+    profile: {
+      nickName: user.nickname || '',
+      avatarUrl: user.avatar_url || '',
+    },
+  };
+}
+
+function verifyProfileSignature(rawData: string, sessionKey: string, signature: string) {
+  const computed = crypto.createHash('sha1').update(`${rawData}${sessionKey}`, 'utf8').digest('hex');
+  return computed === signature;
+}
+
+function decryptSensitiveData(encryptedData: string, sessionKey: string, iv: string) {
+  const decipher = crypto.createDecipheriv(
+    'aes-128-cbc',
+    Buffer.from(sessionKey, 'base64'),
+    Buffer.from(iv, 'base64'),
+  );
+  decipher.setAutoPadding(true);
+  const decoded = Buffer.concat([
+    decipher.update(Buffer.from(encryptedData, 'base64')),
+    decipher.final(),
+  ]);
+  return JSON.parse(decoded.toString('utf8'));
+}
+
+async function fetchSession(code?: string, anonymousCode?: string): Promise<SessionResult> {
   const response = await fetch('https://developer.toutiao.com/api/apps/v2/jscode2session', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      appid: DOUYIN_APP_ID,
+      appid: MINI_GAME_APP_ID,
       secret: DOUYIN_APP_SECRET,
-      code,
-      anonymous_code: '',
+      code: code || '',
+      anonymous_code: anonymousCode || '',
     }),
   });
 
@@ -51,14 +122,63 @@ async function fetchOpenId(code: string): Promise<string> {
     throw new Error(`jscode2session failed: err_no=${json.err_no}, err_tips=${json.err_tips}`);
   }
 
-  return json.data.openid;
+  return json.data || {};
+}
+
+async function upsertUserFromSession(
+  db: Awaited<ReturnType<typeof initDb>>,
+  session: SessionResult,
+  appId?: string
+) {
+  const openid = session.openid || null;
+  const anonymousOpenId = session.anonymous_openid || null;
+  const unionid = session.unionid || null;
+  const sessionKey = session.session_key || null;
+  const authType: 'login' | 'anonymous' = openid ? 'login' : 'anonymous';
+
+  let user =
+    (openid
+      ? await db.get<StoredUser>('SELECT * FROM users WHERE openid = ?', [openid])
+      : null) ||
+    (anonymousOpenId
+      ? await db.get<StoredUser>('SELECT * FROM users WHERE anonymous_openid = ?', [anonymousOpenId])
+      : null);
+
+  if (!user) {
+    const userId = crypto.randomUUID();
+    await db.run(
+      `INSERT INTO users (
+        id, openid, anonymous_openid, unionid, auth_type, app_id, session_key, created_at, updated_at, last_login_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime("now"), datetime("now"), datetime("now"))`,
+      [userId, openid, anonymousOpenId, unionid, authType, appId || MINI_GAME_APP_ID, sessionKey]
+    );
+    await db.run('INSERT INTO progress (user_id) VALUES (?)', [userId]);
+    user = await db.get<StoredUser>('SELECT * FROM users WHERE id = ?', [userId]);
+  } else {
+    await db.run(
+      `UPDATE users
+       SET openid = COALESCE(?, openid),
+           anonymous_openid = COALESCE(?, anonymous_openid),
+           unionid = COALESCE(?, unionid),
+           auth_type = ?,
+           app_id = COALESCE(?, app_id),
+           session_key = COALESCE(?, session_key),
+           updated_at = datetime("now"),
+           last_login_at = datetime("now")
+       WHERE id = ?`,
+      [openid, anonymousOpenId, unionid, authType, appId || MINI_GAME_APP_ID, sessionKey, user.id]
+    );
+    user = await db.get<StoredUser>('SELECT * FROM users WHERE id = ?', [user.id]);
+  }
+
+  return user!;
 }
 
 async function startServer() {
   const app = express();
   const db = await initDb();
 
-  app.use(express.json());
+  app.use(express.json({ limit: '1mb' }));
 
   if (IS_DEV) {
     app.use((req, _res, next) => {
@@ -72,6 +192,7 @@ async function startServer() {
       ok: true,
       service: 'light-refraction-server',
       env: process.env.NODE_ENV || 'development',
+      appId: MINI_GAME_APP_ID,
     });
   });
 
@@ -98,56 +219,148 @@ async function startServer() {
   };
 
   app.post('/api/auth/douyinLogin', async (req, res) => {
-    const { code } = req.body ?? {};
-    if (!code || typeof code !== 'string') {
-      return res.status(400).json({ error: 'code 不能为空' });
+    const { code, anonymousCode, isLogin, appId } = req.body ?? {};
+    if ((!code || typeof code !== 'string') && (!anonymousCode || typeof anonymousCode !== 'string')) {
+      return res.status(400).json({ error: 'code 或 anonymousCode 至少传一个' });
     }
 
-    let openid: string;
+    let session: SessionResult;
 
     try {
-      if (IS_DEV || code.startsWith('mock_')) {
-        openid = `mock_openid_${crypto.createHash('md5').update(code).digest('hex').slice(0, 16)}`;
-        console.log(`[auth] mock login, openid=${openid}`);
+      if (IS_DEV && code && String(code).startsWith('mock_')) {
+        session = {
+          openid: isLogin ? `mock_openid_${crypto.createHash('md5').update(code).digest('hex').slice(0, 16)}` : undefined,
+          anonymous_openid: anonymousCode
+            ? `mock_anonymous_${crypto.createHash('md5').update(anonymousCode).digest('hex').slice(0, 16)}`
+            : undefined,
+          session_key: Buffer.from('mock-session-key-16').toString('base64'),
+        };
       } else {
-        openid = await fetchOpenId(code);
-        console.log(`[auth] douyin login, openid=${openid}`);
+        session = await fetchSession(code, anonymousCode);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown error';
-      console.error('[auth] failed to fetch openid:', message);
-      return res.status(500).json({ error: '登录失败，请稍后重试' });
+      console.error('[auth] failed to fetch session:', message);
+      return res.status(500).json({ error: '登录失败，请稍后重试', detail: message });
     }
 
-    let user = await db.get<{ id: string; openid: string; is_vip: number }>(
-      'SELECT * FROM users WHERE openid = ?',
-      [openid]
-    );
-
-    if (!user) {
-      const userId = crypto.randomUUID();
-      await db.run(
-        'INSERT INTO users (id, openid, created_at) VALUES (?, ?, datetime("now"))',
-        [userId, openid]
+    try {
+      const user = await upsertUserFromSession(db, session, appId);
+      const token = jwt.sign(
+        {
+          id: user.id,
+          openid: user.openid || user.anonymous_openid || '',
+          is_vip: !!user.is_vip,
+          auth_type: user.auth_type,
+        },
+        JWT_SECRET,
+        { expiresIn: '30d' }
       );
-      await db.run('INSERT INTO progress (user_id) VALUES (?)', [userId]);
-      user = { id: userId, openid, is_vip: 0 };
-      console.log(`[db] created user ${userId}`);
+
+      return res.json({
+        token,
+        user: buildUserResponse(user),
+        loginResult: {
+          isLogin: !!isLogin,
+          hasCode: !!code,
+          hasAnonymousCode: !!anonymousCode,
+        },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'unknown error';
+      console.error('[auth] failed to upsert user:', message);
+      return res.status(500).json({ error: '用户初始化失败', detail: message });
+    }
+  });
+
+  app.get('/api/auth/me', authenticate, async (req: AuthedRequest, res) => {
+    const user = await db.get<StoredUser>('SELECT * FROM users WHERE id = ?', [req.user!.id]);
+    if (!user) {
+      return res.status(404).json({ error: '用户不存在' });
+    }
+    return res.json({ user: buildUserResponse(user) });
+  });
+
+  app.post('/api/user/profile', authenticate, async (req: AuthedRequest, res) => {
+    const { userInfo, rawData, signature, encryptedData, iv, appId } = req.body ?? {};
+
+    const user = await db.get<(StoredUser & { session_key: string | null })>(
+      'SELECT * FROM users WHERE id = ?',
+      [req.user!.id]
+    );
+    if (!user) {
+      return res.status(404).json({ error: '用户不存在' });
     }
 
-    const token = jwt.sign(
-      { id: user.id, openid: user.openid, is_vip: !!user.is_vip },
-      JWT_SECRET,
-      { expiresIn: '30d' }
+    let profileVerified = false;
+    let decryptedProfile: any = null;
+
+    try {
+      if (
+        user.session_key &&
+        typeof rawData === 'string' &&
+        typeof signature === 'string' &&
+        typeof encryptedData === 'string' &&
+        typeof iv === 'string'
+      ) {
+        profileVerified = verifyProfileSignature(rawData, user.session_key, signature);
+        if (profileVerified) {
+          decryptedProfile = decryptSensitiveData(encryptedData, user.session_key, iv);
+          if (decryptedProfile && decryptedProfile.watermark && typeof decryptedProfile.watermark === 'object') {
+            const watermarkAppId = decryptedProfile.watermark
+              ? decryptedProfile.watermark.appid
+              : undefined;
+            if (watermarkAppId && watermarkAppId !== (appId || MINI_GAME_APP_ID)) {
+              profileVerified = false;
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.warn('[profile] verify/decrypt failed:', error instanceof Error ? error.message : error);
+      profileVerified = false;
+    }
+
+    const nickname = userInfo && typeof userInfo.nickName === 'string' ? userInfo.nickName : user.nickname;
+    const avatarUrl = userInfo && typeof userInfo.avatarUrl === 'string' ? userInfo.avatarUrl : user.avatar_url;
+
+    await db.run(
+      `UPDATE users
+       SET nickname = ?,
+           avatar_url = ?,
+           profile_authorized = 1,
+           profile_verified = ?,
+           profile_payload = ?,
+           profile_raw_data = ?,
+           app_id = COALESCE(?, app_id),
+           last_profile_at = datetime("now"),
+           updated_at = datetime("now")
+       WHERE id = ?`,
+      [
+        nickname || null,
+        avatarUrl || null,
+        profileVerified ? 1 : 0,
+        JSON.stringify(decryptedProfile || userInfo || {}),
+        typeof rawData === 'string' ? rawData : null,
+        appId || MINI_GAME_APP_ID,
+        req.user!.id,
+      ]
     );
 
+    const updatedUser = await db.get<StoredUser>('SELECT * FROM users WHERE id = ?', [req.user!.id]);
     return res.json({
-      token,
-      user: {
-        id: user.id,
-        is_vip: !!user.is_vip,
-      },
+      success: true,
+      verified: profileVerified,
+      user: buildUserResponse(updatedUser!),
     });
+  });
+
+  app.get('/api/user/profile', authenticate, async (req: AuthedRequest, res) => {
+    const user = await db.get<StoredUser>('SELECT * FROM users WHERE id = ?', [req.user!.id]);
+    if (!user) {
+      return res.status(404).json({ error: '用户不存在' });
+    }
+    return res.json({ user: buildUserResponse(user) });
   });
 
   app.get('/api/user/progress', authenticate, async (req: AuthedRequest, res) => {
@@ -156,12 +369,13 @@ async function startServer() {
       'SELECT * FROM progress WHERE user_id = ?',
       [userId]
     );
-    const user = await db.get<{ is_vip: number }>('SELECT is_vip FROM users WHERE id = ?', [userId]);
+    const user = await db.get<StoredUser>('SELECT * FROM users WHERE id = ?', [userId]);
 
     return res.json({
       unlockedLevel: progress?.unlocked_level || 1,
       stars: JSON.parse(progress?.stars || '[]'),
       isVip: !!user?.is_vip,
+      user: user ? buildUserResponse(user) : null,
     });
   });
 
@@ -176,15 +390,21 @@ async function startServer() {
 
   app.post('/api/user/unlockAll', authenticate, async (req: AuthedRequest, res) => {
     const user = req.user!;
-    await db.run('UPDATE users SET is_vip = 1 WHERE id = ?', [user.id]);
+    await db.run('UPDATE users SET is_vip = 1, updated_at = datetime("now") WHERE id = ?', [user.id]);
 
+    const dbUser = await db.get<StoredUser>('SELECT * FROM users WHERE id = ?', [user.id]);
     const token = jwt.sign(
-      { id: user.id, openid: user.openid, is_vip: true },
+      {
+        id: user.id,
+        openid: dbUser?.openid || dbUser?.anonymous_openid || '',
+        is_vip: true,
+        auth_type: dbUser?.auth_type || 'anonymous',
+      },
       JWT_SECRET,
       { expiresIn: '30d' }
     );
 
-    return res.json({ success: true, token });
+    return res.json({ success: true, token, user: dbUser ? buildUserResponse(dbUser) : null });
   });
 
   app.post('/api/user/adRecord', authenticate, async (req: AuthedRequest, res) => {
@@ -231,7 +451,7 @@ async function startServer() {
     }
 
     const orderParams: Record<string, unknown> = {
-      app_id: DOUYIN_APP_ID,
+      app_id: MINI_GAME_APP_ID,
       out_order_no: outOrderNo,
       total_amount: totalAmount,
       subject: description,
@@ -305,7 +525,7 @@ async function startServer() {
       );
 
       if (order?.user_id) {
-        await db.run('UPDATE users SET is_vip = 1 WHERE id = ?', [order.user_id]);
+        await db.run('UPDATE users SET is_vip = 1, updated_at = datetime("now") WHERE id = ?', [order.user_id]);
       }
     }
 
@@ -324,6 +544,7 @@ async function startServer() {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[server] light-refraction-server listening on 0.0.0.0:${PORT} (${IS_DEV ? 'dev' : 'production'})`);
     console.log(`[server] static directory: ${PUBLIC_DIR}`);
+    console.log(`[server] mini game appId: ${MINI_GAME_APP_ID}`);
     if (IS_CLOUD) {
       console.log('[server] running in Douyin Cloud compatible mode');
     }
