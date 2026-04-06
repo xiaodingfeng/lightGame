@@ -61,6 +61,27 @@ export async function initDb() {
       user_id TEXT PRIMARY KEY,
       unlocked_level INTEGER NOT NULL DEFAULT 1,
       stars TEXT NOT NULL DEFAULT '[]',
+      win_streak INTEGER NOT NULL DEFAULT 0,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS checkins (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      checkin_date TEXT NOT NULL, -- YYYY-MM-DD
+      stars_rewarded INTEGER NOT NULL DEFAULT 1,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      UNIQUE(user_id, checkin_date)
+    );
+
+    CREATE TABLE IF NOT EXISTS rankings (
+      user_id TEXT PRIMARY KEY,
+      total_stars INTEGER NOT NULL DEFAULT 0,
+      daily_stars INTEGER NOT NULL DEFAULT 0,
+      win_streak INTEGER NOT NULL DEFAULT 0,
+      last_updated_date TEXT NOT NULL, -- YYYY-MM-DD
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );

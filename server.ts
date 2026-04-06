@@ -486,12 +486,85 @@ async function startServer() {
   });
 
   app.post('/api/user/progress', authenticate, async (req: AuthedRequest, res) => {
-    const { unlockedLevel, stars } = req.body ?? {};
+    const { unlockedLevel, stars, winStreak } = req.body ?? {};
+    const userId = req.user!.id;
+    const today = new Date().toISOString().split('T')[0];
+
     await db.run(
-      'UPDATE progress SET unlocked_level = ?, stars = ?, updated_at = datetime("now") WHERE user_id = ?',
-      [unlockedLevel, JSON.stringify(stars ?? []), req.user!.id]
+      'UPDATE progress SET unlocked_level = ?, stars = ?, win_streak = COALESCE(?, win_streak), updated_at = datetime("now") WHERE user_id = ?',
+      [unlockedLevel, JSON.stringify(stars ?? []), winStreak, userId]
     );
+
+    // Update Rankings
+    const totalStars = (stars ?? []).length;
+    await db.run(
+      `INSERT INTO rankings (user_id, total_stars, daily_stars, win_streak, last_updated_date)
+       VALUES (?, ?, 0, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         total_stars = excluded.total_stars,
+         win_streak = MAX(rankings.win_streak, excluded.win_streak),
+         updated_at = datetime("now")`,
+      [userId, totalStars, winStreak ?? 0, today]
+    );
+
     return res.json({ success: true });
+  });
+
+  app.get('/api/user/checkin', authenticate, async (req: AuthedRequest, res) => {
+    const userId = req.user!.id;
+    const today = new Date().toISOString().split('T')[0];
+    const checkin = await db.get('SELECT * FROM checkins WHERE user_id = ? AND checkin_date = ?', [userId, today]);
+    return res.json({ checkedIn: !!checkin });
+  });
+
+  app.post('/api/user/checkin', authenticate, async (req: AuthedRequest, res) => {
+    const userId = req.user!.id;
+    const today = new Date().toISOString().split('T')[0];
+
+    try {
+      await db.run(
+        'INSERT INTO checkins (user_id, checkin_date, stars_rewarded) VALUES (?, ?, 1)',
+        [userId, today]
+      );
+
+      // Reward: increment total_stars in rankings or something. 
+      // Actually, since stars are tied to specific levels, maybe checkin just gives a "bonus star" count.
+      // For now, let's just record it.
+      
+      return res.json({ success: true });
+    } catch (error) {
+      return res.status(400).json({ error: '今日已签到' });
+    }
+  });
+
+  app.get('/api/rankings', async (req, res) => {
+    const { type } = req.query; // 'total', 'daily', 'streak'
+    const today = new Date().toISOString().split('T')[0];
+
+    let query = '';
+    if (type === 'daily') {
+      query = `
+        SELECT u.nickname, u.avatar_url, r.daily_stars as score
+        FROM rankings r
+        JOIN users u ON r.user_id = u.id
+        WHERE r.last_updated_date = ?
+        ORDER BY r.daily_stars DESC LIMIT 50`;
+    } else if (type === 'streak') {
+      query = `
+        SELECT u.nickname, u.avatar_url, r.win_streak as score
+        FROM rankings r
+        JOIN users u ON r.user_id = u.id
+        ORDER BY r.win_streak DESC LIMIT 50`;
+    } else {
+      query = `
+        SELECT u.nickname, u.avatar_url, r.total_stars as score
+        FROM rankings r
+        JOIN users u ON r.user_id = u.id
+        ORDER BY r.total_stars DESC LIMIT 50`;
+    }
+
+    const list = await db.all(query, type === 'daily' ? [today] : []);
+    return res.json({ list });
   });
 
   app.post('/api/user/unlockAll', authenticate, async (req: AuthedRequest, res) => {
