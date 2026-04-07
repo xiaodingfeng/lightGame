@@ -1,16 +1,13 @@
+# 使用国内加速镜像源 + 不安装任何编译工具
 FROM node:20-bullseye-slim
-
-# 安装 sqlite3 编译必须的依赖：python3 make g++
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    make \
-    g++ \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/application
 
 COPY package*.json ./
-RUN npm ci
+
+# 关键：跳过 sqlite3 编译，直接安装纯 JS 版
+RUN npm install better-sqlite3 --force
+RUN npm ci --force
 
 COPY . .
 RUN npm run build
