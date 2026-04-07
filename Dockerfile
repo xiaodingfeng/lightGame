@@ -1,13 +1,11 @@
-# 使用国内加速镜像源 + 不安装任何编译工具
 FROM node:20-bullseye-slim
 
 WORKDIR /opt/application
 
 COPY package*.json ./
 
-# 关键：跳过 sqlite3 编译，直接安装纯 JS 版
-RUN npm install better-sqlite3 --force
-RUN npm ci --force
+# 核心：跳过原生模块编译，只装纯JS依赖
+RUN npm ci --ignore-scripts
 
 COPY . .
 RUN npm run build
