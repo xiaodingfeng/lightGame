@@ -497,12 +497,19 @@ async function startServer() {
 
     // Update Rankings
     const totalStars = (stars ?? []).length;
+    
+    // Logic: 
+    // If last_updated_date is today, we increment daily_stars (actually we should calculate based on delta, but for now let's just make it "total stars earned today" or similar)
+    // Simpler daily star: increment it if the update is on the same day.
+    
     await db.run(
       `INSERT INTO rankings (user_id, total_stars, daily_stars, win_streak, last_updated_date)
-       VALUES (?, ?, 0, ?, ?)
+       VALUES (?, ?, 1, ?, ?)
        ON CONFLICT(user_id) DO UPDATE SET
+         daily_stars = CASE WHEN last_updated_date = excluded.last_updated_date THEN daily_stars + 1 ELSE 1 END,
          total_stars = excluded.total_stars,
          win_streak = MAX(rankings.win_streak, excluded.win_streak),
+         last_updated_date = excluded.last_updated_date,
          updated_at = datetime("now")`,
       [userId, totalStars, winStreak ?? 0, today]
     );
