@@ -4,8 +4,7 @@ WORKDIR /opt/application
 
 COPY package*.json ./
 
-# 核心：跳过原生模块编译，只装纯JS依赖
-RUN npm ci --ignore-scripts
+RUN npm ci
 
 COPY . .
 RUN npm run build

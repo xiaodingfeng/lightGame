@@ -1,9 +1,11 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
+import fs from 'node:fs';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import jwt from 'jsonwebtoken';
 import { initDb } from './db.js';
 import 'dotenv/config';
+import type Database from 'better-sqlite3';
 
 type JwtUser = {
   id: string;
@@ -171,8 +173,8 @@ async function fetchSession(code?: string, anonymousCode?: string): Promise<Sess
   return json.data || {};
 }
 
-async function upsertUserFromSession(
-  db: Awaited<ReturnType<typeof initDb>>,
+function upsertUserFromSession(
+  db: Database.Database,
   session: SessionResult,
   appId?: string
 ) {
@@ -182,26 +184,23 @@ async function upsertUserFromSession(
   const sessionKey = session.session_key || null;
   const authType: 'login' | 'anonymous' = openid ? 'login' : 'anonymous';
 
-  let user =
-    (openid
-      ? await db.get<StoredUser>('SELECT * FROM users WHERE openid = ?', [openid])
-      : null) ||
-    (anonymousOpenId
-      ? await db.get<StoredUser>('SELECT * FROM users WHERE anonymous_openid = ?', [anonymousOpenId])
-      : null);
+  let user = (openid
+    ? db.prepare('SELECT * FROM users WHERE openid = ?').get(openid)
+    : anonymousOpenId
+    ? db.prepare('SELECT * FROM users WHERE anonymous_openid = ?').get(anonymousOpenId)
+    : null) as StoredUser | null;
 
   if (!user) {
     const userId = crypto.randomUUID();
-    await db.run(
+    db.prepare(
       `INSERT INTO users (
         id, openid, anonymous_openid, unionid, auth_type, app_id, session_key, created_at, updated_at, last_login_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime("now"), datetime("now"), datetime("now"))`,
-      [userId, openid, anonymousOpenId, unionid, authType, appId || MINI_GAME_APP_ID, sessionKey]
-    );
-    await db.run('INSERT INTO progress (user_id) VALUES (?)', [userId]);
-    user = await db.get<StoredUser>('SELECT * FROM users WHERE id = ?', [userId]);
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime("now"), datetime("now"), datetime("now"))`
+    ).run(userId, openid, anonymousOpenId, unionid, authType, appId || MINI_GAME_APP_ID, sessionKey);
+    db.prepare('INSERT INTO progress (user_id) VALUES (?)').run(userId);
+    user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as StoredUser;
   } else {
-    await db.run(
+    db.prepare(
       `UPDATE users
        SET openid = COALESCE(?, openid),
            anonymous_openid = COALESCE(?, anonymous_openid),
@@ -211,10 +210,9 @@ async function upsertUserFromSession(
            session_key = COALESCE(?, session_key),
            updated_at = datetime("now"),
            last_login_at = datetime("now")
-       WHERE id = ?`,
-      [openid, anonymousOpenId, unionid, authType, appId || MINI_GAME_APP_ID, sessionKey, user.id]
-    );
-    user = await db.get<StoredUser>('SELECT * FROM users WHERE id = ?', [user.id]);
+       WHERE id = ?`
+    ).run(openid, anonymousOpenId, unionid, authType, appId || MINI_GAME_APP_ID, sessionKey, user.id);
+    user = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id) as StoredUser;
   }
 
   return user!;
@@ -222,7 +220,7 @@ async function upsertUserFromSession(
 
 async function startServer() {
   const app = express();
-  const db = await initDb();
+  const db = initDb();
 
   app.use(express.json({ limit: '1mb' }));
   app.use((req, res, next) => {
@@ -304,40 +302,20 @@ async function startServer() {
 
   app.post('/api/auth/douyinLogin', async (req, res) => {
     const { code, anonymousCode, isLogin, appId } = req.body ?? {};
-    console.log('[auth] douyinLogin payload:', {
-      hasCode: !!code,
-      hasAnonymousCode: !!anonymousCode,
-      isLogin: !!isLogin,
-      appId: appId || MINI_GAME_APP_ID,
-    });
     if ((!code || typeof code !== 'string') && (!anonymousCode || typeof anonymousCode !== 'string')) {
       return res.status(400).json({ error: 'code 或 anonymousCode 至少传一个' });
     }
 
     let session: SessionResult;
-
     try {
       session = await fetchSession(code, anonymousCode);
-      console.log('[auth] session fetched:', {
-        hasOpenid: !!session.openid,
-        hasAnonymousOpenid: !!session.anonymous_openid,
-        hasUnionid: !!session.unionid,
-        hasSessionKey: !!session.session_key,
-      });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown error';
-      console.error('[auth] failed to fetch session:', message);
       return res.status(500).json({ error: '登录失败，请稍后重试', detail: message });
     }
 
     try {
-      const user = await upsertUserFromSession(db, session, appId);
-      console.log('[auth] user upserted:', {
-        id: user.id,
-        authType: user.auth_type,
-        hasOpenid: !!user.openid,
-        hasAnonymousOpenid: !!user.anonymous_openid,
-      });
+      const user = upsertUserFromSession(db, session, appId);
       const token = jwt.sign(
         {
           id: user.id,
@@ -360,13 +338,12 @@ async function startServer() {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown error';
-      console.error('[auth] failed to upsert user:', message);
       return res.status(500).json({ error: '用户初始化失败', detail: message });
     }
   });
 
   app.get('/api/auth/me', authenticate, async (req: AuthedRequest, res) => {
-    const user = await db.get<StoredUser>('SELECT * FROM users WHERE id = ?', [req.user!.id]);
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user!.id) as StoredUser | null;
     if (!user) {
       return res.status(404).json({ error: '用户不存在' });
     }
@@ -375,19 +352,7 @@ async function startServer() {
 
   app.post('/api/user/profile', authenticate, async (req: AuthedRequest, res) => {
     const { userInfo, rawData, signature, encryptedData, iv, appId } = req.body ?? {};
-    console.log('[profile] payload:', {
-      hasUserInfo: !!userInfo,
-      hasRawData: !!rawData,
-      hasSignature: !!signature,
-      hasEncryptedData: !!encryptedData,
-      hasIv: !!iv,
-      appId: appId || MINI_GAME_APP_ID,
-    });
-
-    const user = await db.get<(StoredUser & { session_key: string | null })>(
-      'SELECT * FROM users WHERE id = ?',
-      [req.user!.id]
-    );
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user!.id) as (StoredUser & { session_key: string | null }) | null;
     if (!user) {
       return res.status(404).json({ error: '用户不存在' });
     }
@@ -407,9 +372,7 @@ async function startServer() {
         if (profileVerified) {
           decryptedProfile = decryptSensitiveData(encryptedData, user.session_key, iv);
           if (decryptedProfile && decryptedProfile.watermark && typeof decryptedProfile.watermark === 'object') {
-            const watermarkAppId = decryptedProfile.watermark
-              ? decryptedProfile.watermark.appid
-              : undefined;
+            const watermarkAppId = decryptedProfile.watermark.appid;
             if (watermarkAppId && watermarkAppId !== (appId || MINI_GAME_APP_ID)) {
               profileVerified = false;
             }
@@ -417,14 +380,13 @@ async function startServer() {
         }
       }
     } catch (error) {
-      console.warn('[profile] verify/decrypt failed:', error instanceof Error ? error.message : error);
       profileVerified = false;
     }
 
     const nickname = userInfo && typeof userInfo.nickName === 'string' ? userInfo.nickName : user.nickname;
     const avatarUrl = userInfo && typeof userInfo.avatarUrl === 'string' ? userInfo.avatarUrl : user.avatar_url;
 
-    await db.run(
+    db.prepare(
       `UPDATE users
        SET nickname = ?,
            avatar_url = ?,
@@ -435,34 +397,27 @@ async function startServer() {
            app_id = COALESCE(?, app_id),
            last_profile_at = datetime("now"),
            updated_at = datetime("now")
-       WHERE id = ?`,
-      [
-        nickname || null,
-        avatarUrl || null,
-        profileVerified ? 1 : 0,
-        JSON.stringify(decryptedProfile || userInfo || {}),
-        typeof rawData === 'string' ? rawData : null,
-        appId || MINI_GAME_APP_ID,
-        req.user!.id,
-      ]
+       WHERE id = ?`
+    ).run(
+      nickname || null,
+      avatarUrl || null,
+      profileVerified ? 1 : 0,
+      JSON.stringify(decryptedProfile || userInfo || {}),
+      typeof rawData === 'string' ? rawData : null,
+      appId || MINI_GAME_APP_ID,
+      req.user!.id
     );
 
-    const updatedUser = await db.get<StoredUser>('SELECT * FROM users WHERE id = ?', [req.user!.id]);
-    console.log('[profile] stored:', {
-      userId: req.user!.id,
-      verified: profileVerified,
-      nickname: nickname || '',
-      hasAvatar: !!avatarUrl,
-    });
+    const updatedUser = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user!.id) as StoredUser;
     return res.json({
       success: true,
       verified: profileVerified,
-      user: buildUserResponse(updatedUser!),
+      user: buildUserResponse(updatedUser),
     });
   });
 
   app.get('/api/user/profile', authenticate, async (req: AuthedRequest, res) => {
-    const user = await db.get<StoredUser>('SELECT * FROM users WHERE id = ?', [req.user!.id]);
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user!.id) as StoredUser | null;
     if (!user) {
       return res.status(404).json({ error: '用户不存在' });
     }
@@ -471,11 +426,8 @@ async function startServer() {
 
   app.get('/api/user/progress', authenticate, async (req: AuthedRequest, res) => {
     const userId = req.user!.id;
-    const progress = await db.get<{ unlocked_level: number; stars: string }>(
-      'SELECT * FROM progress WHERE user_id = ?',
-      [userId]
-    );
-    const user = await db.get<StoredUser>('SELECT * FROM users WHERE id = ?', [userId]);
+    const progress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(userId) as { unlocked_level: number; stars: string } | null;
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as StoredUser | null;
 
     return res.json({
       unlockedLevel: progress?.unlocked_level || 1,
@@ -490,19 +442,12 @@ async function startServer() {
     const userId = req.user!.id;
     const today = new Date().toISOString().split('T')[0];
 
-    await db.run(
-      'UPDATE progress SET unlocked_level = ?, stars = ?, win_streak = COALESCE(?, win_streak), updated_at = datetime("now") WHERE user_id = ?',
-      [unlockedLevel, JSON.stringify(stars ?? []), winStreak, userId]
-    );
+    db.prepare(
+      'UPDATE progress SET unlocked_level = ?, stars = ?, win_streak = COALESCE(?, win_streak), updated_at = datetime("now") WHERE user_id = ?'
+    ).run(unlockedLevel, JSON.stringify(stars ?? []), winStreak, userId);
 
-    // Update Rankings
     const totalStars = (stars ?? []).length;
-    
-    // Logic: 
-    // If last_updated_date is today, we increment daily_stars (actually we should calculate based on delta, but for now let's just make it "total stars earned today" or similar)
-    // Simpler daily star: increment it if the update is on the same day.
-    
-    await db.run(
+    db.prepare(
       `INSERT INTO rankings (user_id, total_stars, daily_stars, win_streak, last_updated_date)
        VALUES (?, ?, 1, ?, ?)
        ON CONFLICT(user_id) DO UPDATE SET
@@ -510,9 +455,8 @@ async function startServer() {
          total_stars = excluded.total_stars,
          win_streak = MAX(rankings.win_streak, excluded.win_streak),
          last_updated_date = excluded.last_updated_date,
-         updated_at = datetime("now")`,
-      [userId, totalStars, winStreak ?? 0, today]
-    );
+         updated_at = datetime("now")`
+    ).run(userId, totalStars, winStreak ?? 0, today);
 
     return res.json({ success: true });
   });
@@ -520,7 +464,7 @@ async function startServer() {
   app.get('/api/user/checkin', authenticate, async (req: AuthedRequest, res) => {
     const userId = req.user!.id;
     const today = new Date().toISOString().split('T')[0];
-    const checkin = await db.get('SELECT * FROM checkins WHERE user_id = ? AND checkin_date = ?', [userId, today]);
+    const checkin = db.prepare('SELECT * FROM checkins WHERE user_id = ? AND checkin_date = ?').get(userId, today);
     return res.json({ checkedIn: !!checkin });
   });
 
@@ -529,15 +473,7 @@ async function startServer() {
     const today = new Date().toISOString().split('T')[0];
 
     try {
-      await db.run(
-        'INSERT INTO checkins (user_id, checkin_date, stars_rewarded) VALUES (?, ?, 1)',
-        [userId, today]
-      );
-
-      // Reward: increment total_stars in rankings or something. 
-      // Actually, since stars are tied to specific levels, maybe checkin just gives a "bonus star" count.
-      // For now, let's just record it.
-      
+      db.prepare('INSERT INTO checkins (user_id, checkin_date, stars_rewarded) VALUES (?, ?, 1)').run(userId, today);
       return res.json({ success: true });
     } catch (error) {
       return res.status(400).json({ error: '今日已签到' });
@@ -545,43 +481,42 @@ async function startServer() {
   });
 
   app.get('/api/rankings', async (req, res) => {
-    const { type } = req.query; // 'total', 'daily', 'streak'
+    const { type } = req.query;
     const today = new Date().toISOString().split('T')[0];
 
-    let query = '';
+    let list = [];
     if (type === 'daily') {
-      query = `
+      list = db.prepare(`
         SELECT u.nickname, u.avatar_url, r.daily_stars as score
         FROM rankings r
         JOIN users u ON r.user_id = u.id
         WHERE r.last_updated_date = ?
-        ORDER BY r.daily_stars DESC LIMIT 50`;
+        ORDER BY r.daily_stars DESC LIMIT 50`).all(today);
     } else if (type === 'streak') {
-      query = `
+      list = db.prepare(`
         SELECT u.nickname, u.avatar_url, r.win_streak as score
         FROM rankings r
         JOIN users u ON r.user_id = u.id
-        ORDER BY r.win_streak DESC LIMIT 50`;
+        ORDER BY r.win_streak DESC LIMIT 50`).all();
     } else {
-      query = `
+      list = db.prepare(`
         SELECT u.nickname, u.avatar_url, r.total_stars as score
         FROM rankings r
         JOIN users u ON r.user_id = u.id
-        ORDER BY r.total_stars DESC LIMIT 50`;
+        ORDER BY r.total_stars DESC LIMIT 50`).all();
     }
 
-    const list = await db.all(query, type === 'daily' ? [today] : []);
     return res.json({ list });
   });
 
   app.post('/api/user/unlockAll', authenticate, async (req: AuthedRequest, res) => {
-    const user = req.user!;
-    await db.run('UPDATE users SET is_vip = 1, updated_at = datetime("now") WHERE id = ?', [user.id]);
+    const userId = req.user!.id;
+    db.prepare('UPDATE users SET is_vip = 1, updated_at = datetime("now") WHERE id = ?').run(userId);
 
-    const dbUser = await db.get<StoredUser>('SELECT * FROM users WHERE id = ?', [user.id]);
+    const dbUser = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as StoredUser | null;
     const token = jwt.sign(
       {
-        id: user.id,
+        id: userId,
         openid: dbUser?.openid || dbUser?.anonymous_openid || '',
         is_vip: true,
         auth_type: dbUser?.auth_type || 'anonymous',
@@ -595,25 +530,18 @@ async function startServer() {
 
   app.post('/api/user/adRecord', authenticate, async (req: AuthedRequest, res) => {
     const { adUnitId } = req.body ?? {};
-    await db.run(
-      'INSERT INTO ad_records (user_id, ad_unit_id, created_at) VALUES (?, ?, datetime("now"))',
-      [req.user!.id, adUnitId]
-    );
+    db.prepare('INSERT INTO ad_records (user_id, ad_unit_id, created_at) VALUES (?, ?, datetime("now"))').run(req.user!.id, adUnitId);
     return res.json({ success: true });
   });
 
   app.post('/api/user/log', authenticate, async (req: AuthedRequest, res) => {
     const { action, details } = req.body ?? {};
-    await db.run(
-      'INSERT INTO operation_logs (user_id, action, details, created_at) VALUES (?, ?, ?, datetime("now"))',
-      [req.user!.id, action, JSON.stringify(details || {})]
-    );
+    db.prepare('INSERT INTO operation_logs (user_id, action, details, created_at) VALUES (?, ?, ?, datetime("now"))').run(req.user!.id, action, JSON.stringify(details || {}));
     return res.json({ success: true });
   });
 
   app.post('/api/pay/createOrder', authenticate, async (req: AuthedRequest, res) => {
     const { price, description } = req.body ?? {};
-
     if (!price || !description) {
       return res.status(400).json({ error: '参数缺失' });
     }
@@ -638,17 +566,14 @@ async function startServer() {
         body: JSON.stringify(orderParams),
       });
       const json = await response.json();
-
       if (json.err_no !== 0) {
         throw new Error(`create order failed: ${json.err_tips}`);
       }
 
       const orderToken = json.data.order_token;
-
-      await db.run(
-        'INSERT INTO orders (user_id, out_order_no, order_token, amount, status, created_at) VALUES (?, ?, ?, ?, ?, datetime("now"))',
-        [req.user!.id, outOrderNo, orderToken, totalAmount, 'pending']
-      );
+      db.prepare(
+        'INSERT INTO orders (user_id, out_order_no, order_token, amount, status, created_at) VALUES (?, ?, ?, ?, ?, datetime("now"))'
+      ).run(req.user!.id, outOrderNo, orderToken, totalAmount, 'pending');
 
       return res.json({
         success: true,
@@ -659,7 +584,6 @@ async function startServer() {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown error';
-      console.error('[pay] failed to create order:', message);
       return res.status(500).json({ error: '创建订单失败', detail: message });
     }
   });
@@ -667,9 +591,7 @@ async function startServer() {
   app.post('/api/pay/callback', async (req, res) => {
     const { timestamp, nonce, msg, msg_signature: signature } = req.body ?? {};
     const computedSign = generatePaySign({ timestamp, nonce, msg });
-
     if (computedSign !== signature) {
-      console.error('[pay.callback] invalid signature');
       return res.json({ err_no: -1, err_tips: '签名错误' });
     }
 
@@ -682,24 +604,13 @@ async function startServer() {
 
     const outOrderNo = msgData.cp_orderno;
     const paymentStatus = msgData.payment_status;
-    console.log(`[pay.callback] order=${outOrderNo}, payment_status=${paymentStatus}`);
-
     if (outOrderNo && paymentStatus === 2) {
-      await db.run(
-        'UPDATE orders SET status = ?, paid_at = datetime("now") WHERE out_order_no = ?',
-        ['paid', outOrderNo]
-      );
-
-      const order = await db.get<{ user_id: string }>(
-        'SELECT user_id FROM orders WHERE out_order_no = ?',
-        [outOrderNo]
-      );
-
+      db.prepare('UPDATE orders SET status = ?, paid_at = datetime("now") WHERE out_order_no = ?').run('paid', outOrderNo);
+      const order = db.prepare('SELECT user_id FROM orders WHERE out_order_no = ?').get(outOrderNo) as { user_id: string } | null;
       if (order?.user_id) {
-        await db.run('UPDATE users SET is_vip = 1, updated_at = datetime("now") WHERE id = ?', [order.user_id]);
+        db.prepare('UPDATE users SET is_vip = 1, updated_at = datetime("now") WHERE id = ?').run(order.user_id);
       }
     }
-
     return res.json({ err_no: 0 });
   });
 
@@ -708,18 +619,11 @@ async function startServer() {
     if (req.path.startsWith('/api')) {
       return res.status(404).json({ error: 'Not found' });
     }
-
     return res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
   });
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[server] light-refraction-server listening on 0.0.0.0:${PORT} (${IS_DEV ? 'dev' : 'production'})`);
-    console.log(`[server] static directory: ${PUBLIC_DIR}`);
-    console.log(`[server] mini game appId: ${MINI_GAME_APP_ID}`);
-    console.log(`[server] app secret set: ${DOUYIN_APP_SECRET ? 'yes' : 'no'}, pay salt set: ${DOUYIN_PAY_SALT ? 'yes' : 'no'}`);
-    if (IS_CLOUD) {
-      console.log('[server] running in Douyin Cloud compatible mode');
-    }
   });
 }
 

@@ -1,41 +1,37 @@
-import fs from 'node:fs/promises';
+import fs from 'node:fs';
 import path from 'node:path';
-import { open } from 'sqlite';
-import sqlite3 from 'sqlite3';
+import Database from 'better-sqlite3';
 
-async function addColumnIfMissing(db: Awaited<ReturnType<typeof open>>, table: string, column: string, definition: string) {
-  const columns = await db.all<{ name: string }[]>(`PRAGMA table_info(${table})`);
-  if (columns.some((item) => item.name === column)) {
+function addColumnIfMissing(db: Database.Database, table: string, column: string, definition: string) {
+  const info = db.pragma(`table_info(${table})`) as any[];
+  if (info.some((col) => col.name === column)) {
     return;
   }
-  await db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
 }
 
-async function createIndexIfMissing(db: Awaited<ReturnType<typeof open>>, name: string, sql: string) {
-  const index = await db.get<{ name: string }>('SELECT name FROM sqlite_master WHERE type = ? AND name = ?', ['index', name]);
+function createIndexIfMissing(db: Database.Database, name: string, sql: string) {
+  const index = db.prepare('SELECT name FROM sqlite_master WHERE type = ? AND name = ?').get('index', name);
   if (index) {
     return;
   }
-  await db.exec(sql);
+  db.prepare(sql).run();
 }
 
-export async function initDb() {
+export function initDb() {
   const preferCloudStorage =
     process.env.DOUYIN_CLOUD === 'true' || process.env.NODE_ENV === 'production';
   const dbPath = process.env.DB_PATH || (preferCloudStorage ? '/data/database.sqlite' : './database.sqlite');
 
-  await fs.mkdir(path.dirname(dbPath), { recursive: true });
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   console.log(`[db] path: ${dbPath}`);
 
-  const db = await open({
-    filename: dbPath,
-    driver: sqlite3.Database,
-  });
+  const db = new Database(dbPath);
 
-  await db.exec('PRAGMA journal_mode = WAL;');
-  await db.exec('PRAGMA foreign_keys = ON;');
+  db.pragma('journal_mode = WAL');
+  db.pragma('foreign_keys = ON');
 
-  await db.exec(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       openid TEXT UNIQUE,
@@ -115,21 +111,22 @@ export async function initDb() {
     );
   `);
 
-  await addColumnIfMissing(db, 'users', 'anonymous_openid', 'TEXT');
-  await addColumnIfMissing(db, 'users', 'unionid', 'TEXT');
-  await addColumnIfMissing(db, 'users', 'auth_type', "TEXT NOT NULL DEFAULT 'anonymous'");
-  await addColumnIfMissing(db, 'users', 'app_id', 'TEXT');
-  await addColumnIfMissing(db, 'users', 'session_key', 'TEXT');
-  await addColumnIfMissing(db, 'users', 'nickname', 'TEXT');
-  await addColumnIfMissing(db, 'users', 'avatar_url', 'TEXT');
-  await addColumnIfMissing(db, 'users', 'profile_authorized', 'BOOLEAN NOT NULL DEFAULT 0');
-  await addColumnIfMissing(db, 'users', 'profile_verified', 'BOOLEAN NOT NULL DEFAULT 0');
-  await addColumnIfMissing(db, 'users', 'profile_payload', 'TEXT');
-  await addColumnIfMissing(db, 'users', 'profile_raw_data', 'TEXT');
-  await addColumnIfMissing(db, 'users', 'last_login_at', 'DATETIME');
-  await addColumnIfMissing(db, 'users', 'last_profile_at', 'DATETIME');
-  await createIndexIfMissing(db, 'idx_users_openid_unique', 'CREATE UNIQUE INDEX idx_users_openid_unique ON users(openid)');
-  await createIndexIfMissing(db, 'idx_users_anonymous_openid_unique', 'CREATE UNIQUE INDEX idx_users_anonymous_openid_unique ON users(anonymous_openid)');
+  addColumnIfMissing(db, 'users', 'anonymous_openid', 'TEXT');
+  addColumnIfMissing(db, 'users', 'unionid', 'TEXT');
+  addColumnIfMissing(db, 'users', 'auth_type', "TEXT NOT NULL DEFAULT 'anonymous'");
+  addColumnIfMissing(db, 'users', 'app_id', 'TEXT');
+  addColumnIfMissing(db, 'users', 'session_key', 'TEXT');
+  addColumnIfMissing(db, 'users', 'nickname', 'TEXT');
+  addColumnIfMissing(db, 'users', 'avatar_url', 'TEXT');
+  addColumnIfMissing(db, 'users', 'profile_authorized', 'BOOLEAN NOT NULL DEFAULT 0');
+  addColumnIfMissing(db, 'users', 'profile_verified', 'BOOLEAN NOT NULL DEFAULT 0');
+  addColumnIfMissing(db, 'users', 'profile_payload', 'TEXT');
+  addColumnIfMissing(db, 'users', 'profile_raw_data', 'TEXT');
+  addColumnIfMissing(db, 'users', 'last_login_at', 'DATETIME');
+  addColumnIfMissing(db, 'users', 'last_profile_at', 'DATETIME');
+  
+  createIndexIfMissing(db, 'idx_users_openid_unique', 'CREATE UNIQUE INDEX idx_users_openid_unique ON users(openid)');
+  createIndexIfMissing(db, 'idx_users_anonymous_openid_unique', 'CREATE UNIQUE INDEX idx_users_anonymous_openid_unique ON users(anonymous_openid)');
 
   console.log('[db] initialized');
   return db;
