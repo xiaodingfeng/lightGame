@@ -4,7 +4,7 @@ WORKDIR /opt/application
 
 COPY package*.json ./
 
-RUN npm ci
+RUN npm i
 
 COPY . .
 RUN npm run build

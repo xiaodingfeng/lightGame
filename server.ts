@@ -134,6 +134,18 @@ function buildUserResponse(user: StoredUser) {
   };
 }
 
+function parseStars(raw: string | null | undefined) {
+  if (!raw) {
+    return [] as number[];
+  }
+  try {
+    const stars = JSON.parse(raw);
+    return Array.isArray(stars) ? stars : [];
+  } catch (error) {
+    return [];
+  }
+}
+
 function verifyProfileSignature(rawData: string, sessionKey: string, signature: string) {
   const computed = crypto.createHash('sha1').update(`${rawData}${sessionKey}`, 'utf8').digest('hex');
   return computed === signature;
@@ -428,10 +440,12 @@ async function startServer() {
     const userId = req.user!.id;
     const progress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(userId) as { unlocked_level: number; stars: string } | null;
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as StoredUser | null;
+    const stars = parseStars(progress?.stars);
 
     return res.json({
       unlockedLevel: progress?.unlocked_level || 1,
-      stars: JSON.parse(progress?.stars || '[]'),
+      stars,
+      starCount: stars.length,
       isVip: !!user?.is_vip,
       user: user ? buildUserResponse(user) : null,
     });
@@ -441,12 +455,13 @@ async function startServer() {
     const { unlockedLevel, stars, winStreak } = req.body ?? {};
     const userId = req.user!.id;
     const today = new Date().toISOString().split('T')[0];
+    const normalizedStars = Array.isArray(stars) ? stars : [];
 
     db.prepare(
       'UPDATE progress SET unlocked_level = ?, stars = ?, win_streak = COALESCE(?, win_streak), updated_at = datetime("now") WHERE user_id = ?'
-    ).run(unlockedLevel, JSON.stringify(stars ?? []), winStreak, userId);
+    ).run(unlockedLevel, JSON.stringify(normalizedStars), winStreak, userId);
 
-    const totalStars = (stars ?? []).length;
+    const totalStars = normalizedStars.length;
     db.prepare(
       `INSERT INTO rankings (user_id, total_stars, daily_stars, win_streak, last_updated_date)
        VALUES (?, ?, 1, ?, ?)
@@ -458,7 +473,7 @@ async function startServer() {
          updated_at = datetime("now")`
     ).run(userId, totalStars, winStreak ?? 0, today);
 
-    return res.json({ success: true });
+    return res.json({ success: true, starCount: totalStars });
   });
 
   app.get('/api/user/checkin', authenticate, async (req: AuthedRequest, res) => {
