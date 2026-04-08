@@ -39,6 +39,14 @@ type StoredUser = {
   app_id: string | null;
 };
 
+type StoredProgress = {
+  user_id: string;
+  unlocked_level: number;
+  stars: string;
+  bonus_stars: number;
+  win_streak: number;
+};
+
 const MINI_GAME_APP_ID =
   process.env.DOUYIN_APP_ID ||
   process.env.APP_ID ||
@@ -150,6 +158,30 @@ function getTotalStars(stars: number[], bonusStars: number) {
   return stars.length + Math.max(0, bonusStars || 0);
 }
 
+function mergeProgressForUser(db: Database.Database, targetUserId: string, sourceUserId: string) {
+  const targetProgress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(targetUserId) as StoredProgress | null;
+  const sourceProgress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(sourceUserId) as StoredProgress | null;
+  const targetStars = parseStars(targetProgress?.stars);
+  const sourceStars = parseStars(sourceProgress?.stars);
+  const mergedStars = Array.from(new Set([...targetStars, ...sourceStars])).sort((a, b) => a - b);
+  const mergedBonusStars = (targetProgress?.bonus_stars || 0) + (sourceProgress?.bonus_stars || 0);
+  const mergedUnlockedLevel = Math.max(targetProgress?.unlocked_level || 1, sourceProgress?.unlocked_level || 1);
+  const mergedWinStreak = Math.max(targetProgress?.win_streak || 0, sourceProgress?.win_streak || 0);
+
+  db.prepare(
+    `INSERT INTO progress (user_id, unlocked_level, stars, bonus_stars, win_streak, updated_at)
+     VALUES (?, ?, ?, ?, ?, datetime("now"))
+     ON CONFLICT(user_id) DO UPDATE SET
+       unlocked_level = excluded.unlocked_level,
+       stars = excluded.stars,
+       bonus_stars = excluded.bonus_stars,
+       win_streak = excluded.win_streak,
+       updated_at = datetime("now")`
+  ).run(targetUserId, mergedUnlockedLevel, JSON.stringify(mergedStars), mergedBonusStars, mergedWinStreak);
+
+  db.prepare('DELETE FROM progress WHERE user_id = ?').run(sourceUserId);
+}
+
 function verifyProfileSignature(rawData: string, sessionKey: string, signature: string) {
   const computed = crypto.createHash('sha1').update(`${rawData}${sessionKey}`, 'utf8').digest('hex');
   return computed === signature;
@@ -200,11 +232,38 @@ function upsertUserFromSession(
   const sessionKey = session.session_key || null;
   const authType: 'login' | 'anonymous' = openid ? 'login' : 'anonymous';
 
-  let user = (openid
+  const loginUser = (openid
     ? db.prepare('SELECT * FROM users WHERE openid = ?').get(openid)
-    : anonymousOpenId
+    : null) as StoredUser | null;
+  const anonymousUser = (anonymousOpenId
     ? db.prepare('SELECT * FROM users WHERE anonymous_openid = ?').get(anonymousOpenId)
     : null) as StoredUser | null;
+
+  let user = loginUser || anonymousUser;
+
+  if (loginUser && anonymousUser && loginUser.id !== anonymousUser.id) {
+    mergeProgressForUser(db, loginUser.id, anonymousUser.id);
+    db.prepare(
+      `UPDATE users
+       SET anonymous_openid = COALESCE(?, anonymous_openid),
+           unionid = COALESCE(?, unionid),
+           app_id = COALESCE(?, app_id),
+           session_key = COALESCE(?, session_key),
+           is_vip = MAX(is_vip, ?),
+           updated_at = datetime("now"),
+           last_login_at = datetime("now")
+       WHERE id = ?`
+    ).run(
+      anonymousOpenId,
+      unionid,
+      appId || MINI_GAME_APP_ID,
+      sessionKey,
+      anonymousUser.is_vip,
+      loginUser.id
+    );
+    db.prepare('DELETE FROM users WHERE id = ?').run(anonymousUser.id);
+    user = db.prepare('SELECT * FROM users WHERE id = ?').get(loginUser.id) as StoredUser;
+  }
 
   if (!user) {
     const userId = crypto.randomUUID();
