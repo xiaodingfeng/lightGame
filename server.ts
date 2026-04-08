@@ -146,6 +146,10 @@ function parseStars(raw: string | null | undefined) {
   }
 }
 
+function getTotalStars(stars: number[], bonusStars: number) {
+  return stars.length + Math.max(0, bonusStars || 0);
+}
+
 function verifyProfileSignature(rawData: string, sessionKey: string, signature: string) {
   const computed = crypto.createHash('sha1').update(`${rawData}${sessionKey}`, 'utf8').digest('hex');
   return computed === signature;
@@ -438,42 +442,75 @@ async function startServer() {
 
   app.get('/api/user/progress', authenticate, async (req: AuthedRequest, res) => {
     const userId = req.user!.id;
-    const progress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(userId) as { unlocked_level: number; stars: string } | null;
+    const progress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(userId) as {
+      unlocked_level: number;
+      stars: string;
+      bonus_stars: number;
+      win_streak: number;
+    } | null;
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as StoredUser | null;
     const stars = parseStars(progress?.stars);
+    const bonusStars = progress?.bonus_stars || 0;
 
     return res.json({
       unlockedLevel: progress?.unlocked_level || 1,
       stars,
-      starCount: stars.length,
+      bonusStars,
+      starCount: getTotalStars(stars, bonusStars),
+      winStreak: progress?.win_streak || 0,
       isVip: !!user?.is_vip,
       user: user ? buildUserResponse(user) : null,
     });
   });
 
   app.post('/api/user/progress', authenticate, async (req: AuthedRequest, res) => {
-    const { unlockedLevel, stars, winStreak } = req.body ?? {};
+    const { unlockedLevel, stars, winStreak, bonusStars } = req.body ?? {};
     const userId = req.user!.id;
     const today = new Date().toISOString().split('T')[0];
-    const normalizedStars = Array.isArray(stars) ? stars : [];
+    const existingProgress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(userId) as {
+      unlocked_level: number;
+      stars: string;
+      bonus_stars: number;
+      win_streak: number;
+    } | null;
+    const existingStars = parseStars(existingProgress?.stars);
+    const nextStars = Array.isArray(stars) ? stars : [];
+    const mergedStars = Array.from(new Set([...existingStars, ...nextStars]))
+      .map((item) => Number(item))
+      .filter((item) => Number.isFinite(item))
+      .sort((a, b) => a - b);
+    const nextBonusStars = typeof bonusStars === 'number'
+      ? Math.max(0, Math.floor(bonusStars))
+      : (existingProgress?.bonus_stars || 0);
+    const previousTotalStars = getTotalStars(existingStars, existingProgress?.bonus_stars || 0);
+    const totalStars = getTotalStars(mergedStars, nextBonusStars);
+    const earnedDelta = Math.max(0, totalStars - previousTotalStars);
 
     db.prepare(
-      'UPDATE progress SET unlocked_level = ?, stars = ?, win_streak = COALESCE(?, win_streak), updated_at = datetime("now") WHERE user_id = ?'
-    ).run(unlockedLevel, JSON.stringify(normalizedStars), winStreak, userId);
+      'UPDATE progress SET unlocked_level = MAX(COALESCE(?, unlocked_level), unlocked_level), stars = ?, bonus_stars = ?, win_streak = COALESCE(?, win_streak), updated_at = datetime("now") WHERE user_id = ?'
+    ).run(unlockedLevel, JSON.stringify(mergedStars), nextBonusStars, winStreak, userId);
 
-    const totalStars = normalizedStars.length;
     db.prepare(
       `INSERT INTO rankings (user_id, total_stars, daily_stars, win_streak, last_updated_date)
-       VALUES (?, ?, 1, ?, ?)
+       VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(user_id) DO UPDATE SET
-         daily_stars = CASE WHEN last_updated_date = excluded.last_updated_date THEN daily_stars + 1 ELSE 1 END,
+         daily_stars = CASE
+           WHEN last_updated_date = excluded.last_updated_date THEN daily_stars + excluded.daily_stars
+           ELSE excluded.daily_stars
+         END,
          total_stars = excluded.total_stars,
          win_streak = MAX(rankings.win_streak, excluded.win_streak),
          last_updated_date = excluded.last_updated_date,
          updated_at = datetime("now")`
-    ).run(userId, totalStars, winStreak ?? 0, today);
+    ).run(userId, totalStars, earnedDelta, winStreak ?? 0, today);
 
-    return res.json({ success: true, starCount: totalStars });
+    return res.json({
+      success: true,
+      stars: mergedStars,
+      bonusStars: nextBonusStars,
+      starCount: totalStars,
+      winStreak: winStreak ?? (existingProgress?.win_streak || 0)
+    });
   });
 
   app.get('/api/user/checkin', authenticate, async (req: AuthedRequest, res) => {
@@ -489,7 +526,36 @@ async function startServer() {
 
     try {
       db.prepare('INSERT INTO checkins (user_id, checkin_date, stars_rewarded) VALUES (?, ?, 1)').run(userId, today);
-      return res.json({ success: true });
+      db.prepare(
+        'UPDATE progress SET bonus_stars = COALESCE(bonus_stars, 0) + 1, updated_at = datetime("now") WHERE user_id = ?'
+      ).run(userId);
+
+      const progress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(userId) as {
+        stars: string;
+        bonus_stars: number;
+        win_streak: number;
+      } | null;
+      const stars = parseStars(progress?.stars);
+      const nextBonusStars = progress?.bonus_stars || 0;
+      const totalStars = getTotalStars(stars, nextBonusStars);
+
+      db.prepare(
+        `INSERT INTO rankings (user_id, total_stars, daily_stars, win_streak, last_updated_date)
+         VALUES (?, ?, 1, ?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET
+           daily_stars = CASE WHEN last_updated_date = excluded.last_updated_date THEN daily_stars + 1 ELSE 1 END,
+           total_stars = excluded.total_stars,
+           win_streak = MAX(rankings.win_streak, excluded.win_streak),
+           last_updated_date = excluded.last_updated_date,
+           updated_at = datetime("now")`
+      ).run(userId, totalStars, progress?.win_streak || 0, today);
+
+      return res.json({
+        success: true,
+        checkedIn: true,
+        bonusStars: nextBonusStars,
+        starCount: totalStars
+      });
     } catch (error) {
       return res.status(400).json({ error: '今日已签到' });
     }
