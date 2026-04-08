@@ -80,6 +80,19 @@ function safeLogBody(body: unknown) {
   return cloned;
 }
 
+function getRequestId(req: Request) {
+  return (req as Request & { requestId?: string }).requestId || 'unknown';
+}
+
+function logWithRequest(req: Request, label: string, payload?: unknown) {
+  const requestId = getRequestId(req);
+  if (typeof payload === 'undefined') {
+    console.log(`[req:${requestId}] ${label}`);
+    return;
+  }
+  console.log(`[req:${requestId}] ${label}`, payload);
+}
+
 function tryResolveGatewayTarget(req: Request) {
   const candidates = [
     req.headers['x-tt-path'],
@@ -170,13 +183,13 @@ function mergeProgressForUser(db: Database.Database, targetUserId: string, sourc
 
   db.prepare(
     `INSERT INTO progress (user_id, unlocked_level, stars, bonus_stars, win_streak, updated_at)
-     VALUES (?, ?, ?, ?, ?, datetime("now"))
+     VALUES (?, ?, ?, ?, ?, datetime('now'))
      ON CONFLICT(user_id) DO UPDATE SET
        unlocked_level = excluded.unlocked_level,
        stars = excluded.stars,
        bonus_stars = excluded.bonus_stars,
        win_streak = excluded.win_streak,
-       updated_at = datetime("now")`
+       updated_at = datetime('now')`
   ).run(targetUserId, mergedUnlockedLevel, JSON.stringify(mergedStars), mergedBonusStars, mergedWinStreak);
 
   db.prepare('DELETE FROM progress WHERE user_id = ?').run(sourceUserId);
@@ -221,6 +234,54 @@ async function fetchSession(code?: string, anonymousCode?: string): Promise<Sess
   return json.data || {};
 }
 
+async function fetchSessionWithLog(req: Request, code?: string, anonymousCode?: string): Promise<SessionResult> {
+  logWithRequest(req, '[auth] jscode2session.request', {
+    hasCode: !!code,
+    hasAnonymousCode: !!anonymousCode,
+    appId: MINI_GAME_APP_ID,
+    isDev: IS_DEV
+  });
+
+  const response = await fetch('https://developer.toutiao.com/api/apps/v2/jscode2session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      appid: MINI_GAME_APP_ID,
+      secret: DOUYIN_APP_SECRET,
+      code: code || '',
+      anonymous_code: anonymousCode || '',
+    }),
+  });
+
+  let json: any = null;
+  try {
+    json = await response.json();
+  } catch (error) {
+    logWithRequest(req, '[auth] jscode2session.invalid_json', {
+      status: response.status,
+      statusText: response.statusText,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    throw error;
+  }
+
+  logWithRequest(req, '[auth] jscode2session.response', {
+    status: response.status,
+    err_no: json && typeof json.err_no !== 'undefined' ? json.err_no : undefined,
+    err_tips: json && json.err_tips ? json.err_tips : '',
+    hasOpenId: !!(json && json.data && json.data.openid),
+    hasAnonymousOpenId: !!(json && json.data && json.data.anonymous_openid),
+    hasUnionId: !!(json && json.data && json.data.unionid),
+    hasSessionKey: !!(json && json.data && json.data.session_key)
+  });
+
+  if (json.err_no !== 0) {
+    throw new Error(`jscode2session failed: err_no=${json.err_no}, err_tips=${json.err_tips}`);
+  }
+
+  return json.data || {};
+}
+
 function upsertUserFromSession(
   db: Database.Database,
   session: SessionResult,
@@ -250,8 +311,8 @@ function upsertUserFromSession(
            app_id = COALESCE(?, app_id),
            session_key = COALESCE(?, session_key),
            is_vip = MAX(is_vip, ?),
-           updated_at = datetime("now"),
-           last_login_at = datetime("now")
+           updated_at = datetime('now'),
+           last_login_at = datetime('now')
        WHERE id = ?`
     ).run(
       anonymousOpenId,
@@ -270,7 +331,7 @@ function upsertUserFromSession(
     db.prepare(
       `INSERT INTO users (
         id, openid, anonymous_openid, unionid, auth_type, app_id, session_key, created_at, updated_at, last_login_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime("now"), datetime("now"), datetime("now"))`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), datetime('now'))`
     ).run(userId, openid, anonymousOpenId, unionid, authType, appId || MINI_GAME_APP_ID, sessionKey);
     db.prepare('INSERT INTO progress (user_id) VALUES (?)').run(userId);
     user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as StoredUser;
@@ -283,14 +344,63 @@ function upsertUserFromSession(
            auth_type = ?,
            app_id = COALESCE(?, app_id),
            session_key = COALESCE(?, session_key),
-           updated_at = datetime("now"),
-           last_login_at = datetime("now")
+           updated_at = datetime('now'),
+           last_login_at = datetime('now')
        WHERE id = ?`
     ).run(openid, anonymousOpenId, unionid, authType, appId || MINI_GAME_APP_ID, sessionKey, user.id);
     user = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id) as StoredUser;
   }
 
   return user!;
+}
+
+function upsertUserFromSessionWithLog(
+  req: Request,
+  db: Database.Database,
+  session: SessionResult,
+  appId?: string
+) {
+  logWithRequest(req, '[auth] upsert.begin', {
+    appId: appId || MINI_GAME_APP_ID,
+    hasOpenId: !!session.openid,
+    hasAnonymousOpenId: !!session.anonymous_openid,
+    hasUnionId: !!session.unionid,
+    hasSessionKey: !!session.session_key
+  });
+
+  const openid = session.openid || null;
+  const anonymousOpenId = session.anonymous_openid || null;
+  const loginUser = (openid
+    ? db.prepare('SELECT id, auth_type, is_vip FROM users WHERE openid = ?').get(openid)
+    : null) as { id: string; auth_type: string; is_vip: number } | null;
+  const anonymousUser = (anonymousOpenId
+    ? db.prepare('SELECT id, auth_type, is_vip FROM users WHERE anonymous_openid = ?').get(anonymousOpenId)
+    : null) as { id: string; auth_type: string; is_vip: number } | null;
+
+  logWithRequest(req, '[auth] upsert.lookup', {
+    loginUserId: loginUser ? loginUser.id : '',
+    anonymousUserId: anonymousUser ? anonymousUser.id : '',
+    willMerge: !!(loginUser && anonymousUser && loginUser.id !== anonymousUser.id)
+  });
+
+  let user: StoredUser;
+  try {
+    user = upsertUserFromSession(db, session, appId);
+  } catch (error) {
+    logWithRequest(req, '[auth] upsert.internal.failed', {
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : ''
+    });
+    throw error;
+  }
+  logWithRequest(req, '[auth] upsert.done', {
+    userId: user.id,
+    authType: user.auth_type,
+    isVip: !!user.is_vip,
+    hasOpenId: !!user.openid,
+    hasAnonymousOpenId: !!user.anonymous_openid
+  });
+  return user;
 }
 
 async function startServer() {
@@ -377,20 +487,31 @@ async function startServer() {
 
   app.post('/api/auth/douyinLogin', async (req, res) => {
     const { code, anonymousCode, isLogin, appId } = req.body ?? {};
+    logWithRequest(req, '[auth] douyinLogin.payload', {
+      isLogin: !!isLogin,
+      hasCode: !!code,
+      hasAnonymousCode: !!anonymousCode,
+      appId: appId || MINI_GAME_APP_ID,
+      xTtOpenId: typeof req.headers['x-tt-openid'] === 'string' ? maskValue(req.headers['x-tt-openid']) : ''
+    });
     if ((!code || typeof code !== 'string') && (!anonymousCode || typeof anonymousCode !== 'string')) {
       return res.status(400).json({ error: 'code 或 anonymousCode 至少传一个' });
     }
 
     let session: SessionResult;
     try {
-      session = await fetchSession(code, anonymousCode);
+      session = await fetchSessionWithLog(req, code, anonymousCode);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown error';
+      logWithRequest(req, '[auth] douyinLogin.fetchSession.failed', {
+        message,
+        stack: error instanceof Error ? error.stack : ''
+      });
       return res.status(500).json({ error: '登录失败，请稍后重试', detail: message });
     }
 
     try {
-      const user = upsertUserFromSession(db, session, appId);
+      const user = upsertUserFromSessionWithLog(req, db, session, appId);
       const token = jwt.sign(
         {
           id: user.id,
@@ -401,6 +522,13 @@ async function startServer() {
         JWT_SECRET,
         { expiresIn: '30d' }
       );
+
+      logWithRequest(req, '[auth] douyinLogin.success', {
+        userId: user.id,
+        authType: user.auth_type,
+        isVip: !!user.is_vip,
+        hasToken: !!token
+      });
 
       return res.json({
         token,
@@ -470,8 +598,8 @@ async function startServer() {
            profile_payload = ?,
            profile_raw_data = ?,
            app_id = COALESCE(?, app_id),
-           last_profile_at = datetime("now"),
-           updated_at = datetime("now")
+           last_profile_at = datetime('now'),
+           updated_at = datetime('now')
        WHERE id = ?`
     ).run(
       nickname || null,
@@ -546,7 +674,7 @@ async function startServer() {
     const earnedDelta = Math.max(0, totalStars - previousTotalStars);
 
     db.prepare(
-      'UPDATE progress SET unlocked_level = MAX(COALESCE(?, unlocked_level), unlocked_level), stars = ?, bonus_stars = ?, win_streak = COALESCE(?, win_streak), updated_at = datetime("now") WHERE user_id = ?'
+      'UPDATE progress SET unlocked_level = MAX(COALESCE(?, unlocked_level), unlocked_level), stars = ?, bonus_stars = ?, win_streak = COALESCE(?, win_streak), updated_at = datetime(\'now\') WHERE user_id = ?'
     ).run(unlockedLevel, JSON.stringify(mergedStars), nextBonusStars, winStreak, userId);
 
     db.prepare(
@@ -560,7 +688,7 @@ async function startServer() {
          total_stars = excluded.total_stars,
          win_streak = MAX(rankings.win_streak, excluded.win_streak),
          last_updated_date = excluded.last_updated_date,
-         updated_at = datetime("now")`
+         updated_at = datetime('now')`
     ).run(userId, totalStars, earnedDelta, winStreak ?? 0, today);
 
     return res.json({
@@ -586,7 +714,7 @@ async function startServer() {
     try {
       db.prepare('INSERT INTO checkins (user_id, checkin_date, stars_rewarded) VALUES (?, ?, 1)').run(userId, today);
       db.prepare(
-        'UPDATE progress SET bonus_stars = COALESCE(bonus_stars, 0) + 1, updated_at = datetime("now") WHERE user_id = ?'
+        'UPDATE progress SET bonus_stars = COALESCE(bonus_stars, 0) + 1, updated_at = datetime(\'now\') WHERE user_id = ?'
       ).run(userId);
 
       const progress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(userId) as {
@@ -606,7 +734,7 @@ async function startServer() {
            total_stars = excluded.total_stars,
            win_streak = MAX(rankings.win_streak, excluded.win_streak),
            last_updated_date = excluded.last_updated_date,
-           updated_at = datetime("now")`
+           updated_at = datetime('now')`
       ).run(userId, totalStars, progress?.win_streak || 0, today);
 
       return res.json({
@@ -651,7 +779,7 @@ async function startServer() {
 
   app.post('/api/user/unlockAll', authenticate, async (req: AuthedRequest, res) => {
     const userId = req.user!.id;
-    db.prepare('UPDATE users SET is_vip = 1, updated_at = datetime("now") WHERE id = ?').run(userId);
+    db.prepare('UPDATE users SET is_vip = 1, updated_at = datetime(\'now\') WHERE id = ?').run(userId);
 
     const dbUser = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as StoredUser | null;
     const token = jwt.sign(
@@ -670,13 +798,13 @@ async function startServer() {
 
   app.post('/api/user/adRecord', authenticate, async (req: AuthedRequest, res) => {
     const { adUnitId } = req.body ?? {};
-    db.prepare('INSERT INTO ad_records (user_id, ad_unit_id, created_at) VALUES (?, ?, datetime("now"))').run(req.user!.id, adUnitId);
+    db.prepare('INSERT INTO ad_records (user_id, ad_unit_id, created_at) VALUES (?, ?, datetime(\'now\'))').run(req.user!.id, adUnitId);
     return res.json({ success: true });
   });
 
   app.post('/api/user/log', authenticate, async (req: AuthedRequest, res) => {
     const { action, details } = req.body ?? {};
-    db.prepare('INSERT INTO operation_logs (user_id, action, details, created_at) VALUES (?, ?, ?, datetime("now"))').run(req.user!.id, action, JSON.stringify(details || {}));
+    db.prepare('INSERT INTO operation_logs (user_id, action, details, created_at) VALUES (?, ?, ?, datetime(\'now\'))').run(req.user!.id, action, JSON.stringify(details || {}));
     return res.json({ success: true });
   });
 
@@ -712,7 +840,7 @@ async function startServer() {
 
       const orderToken = json.data.order_token;
       db.prepare(
-        'INSERT INTO orders (user_id, out_order_no, order_token, amount, status, created_at) VALUES (?, ?, ?, ?, ?, datetime("now"))'
+        'INSERT INTO orders (user_id, out_order_no, order_token, amount, status, created_at) VALUES (?, ?, ?, ?, ?, datetime(\'now\'))'
       ).run(req.user!.id, outOrderNo, orderToken, totalAmount, 'pending');
 
       return res.json({
@@ -745,10 +873,10 @@ async function startServer() {
     const outOrderNo = msgData.cp_orderno;
     const paymentStatus = msgData.payment_status;
     if (outOrderNo && paymentStatus === 2) {
-      db.prepare('UPDATE orders SET status = ?, paid_at = datetime("now") WHERE out_order_no = ?').run('paid', outOrderNo);
+      db.prepare('UPDATE orders SET status = ?, paid_at = datetime(\'now\') WHERE out_order_no = ?').run('paid', outOrderNo);
       const order = db.prepare('SELECT user_id FROM orders WHERE out_order_no = ?').get(outOrderNo) as { user_id: string } | null;
       if (order?.user_id) {
-        db.prepare('UPDATE users SET is_vip = 1, updated_at = datetime("now") WHERE id = ?').run(order.user_id);
+      db.prepare('UPDATE users SET is_vip = 1, updated_at = datetime(\'now\') WHERE id = ?').run(order.user_id);
       }
     }
     return res.json({ err_no: 0 });
