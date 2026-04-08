@@ -59,6 +59,9 @@ export function initDb() {
       stars TEXT NOT NULL DEFAULT '[]',
       milestone_stars TEXT NOT NULL DEFAULT '[]',
       bonus_stars INTEGER NOT NULL DEFAULT 0,
+      energy INTEGER NOT NULL DEFAULT 10,
+      energy_updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      sidebar_reward_claimed INTEGER NOT NULL DEFAULT 0,
       win_streak INTEGER NOT NULL DEFAULT 0,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -131,6 +134,9 @@ export function initDb() {
   createIndexIfMissing(db, 'idx_users_anonymous_openid_unique', 'CREATE UNIQUE INDEX idx_users_anonymous_openid_unique ON users(anonymous_openid)');
   addColumnIfMissing(db, 'progress', 'milestone_stars', "TEXT NOT NULL DEFAULT '[]'");
   addColumnIfMissing(db, 'progress', 'bonus_stars', 'INTEGER NOT NULL DEFAULT 0');
+  addColumnIfMissing(db, 'progress', 'energy', 'INTEGER NOT NULL DEFAULT 10');
+  addColumnIfMissing(db, 'progress', 'energy_updated_at', 'DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP');
+  addColumnIfMissing(db, 'progress', 'sidebar_reward_claimed', 'INTEGER NOT NULL DEFAULT 0');
 
   console.log('[db] initialized');
   return db;

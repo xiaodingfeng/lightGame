@@ -45,7 +45,18 @@ type StoredProgress = {
   stars: string;
   milestone_stars: string;
   bonus_stars: number;
+  energy: number;
+  energy_updated_at: string | null;
+  sidebar_reward_claimed: number;
   win_streak: number;
+};
+
+type EnergySnapshot = {
+  energy: number;
+  energyUpdatedAt: string;
+  nextEnergyAt: string | null;
+  secondsToNextEnergy: number;
+  sidebarRewardClaimed: boolean;
 };
 
 const MINI_GAME_APP_ID =
@@ -66,6 +77,8 @@ const DEFAULT_PORT = IS_CLOUD ? '8000' : '3000';
 const PORT = Number.parseInt(process.env.PORT || DEFAULT_PORT, 10);
 const PUBLIC_DIR = process.env.PUBLIC_DIR || path.join(process.cwd(), 'public');
 const IS_DEV = process.env.NODE_ENV !== 'production' || !DOUYIN_APP_SECRET;
+const ENERGY_RESTORE_MS = 5 * 60 * 1000;
+const ENERGY_CAP = 10;
 
 function safeLogBody(body: unknown) {
   if (!body || typeof body !== 'object') {
@@ -172,6 +185,53 @@ function getTotalStars(stars: number[], milestoneStars: number[], bonusStars: nu
   return stars.length + milestoneStars.length + Math.max(0, bonusStars || 0);
 }
 
+function toValidTimeMs(raw?: string | null) {
+  const time = raw ? Date.parse(raw) : NaN;
+  return Number.isFinite(time) ? time : Date.now();
+}
+
+function getEnergySnapshot(progress?: Partial<StoredProgress> | null, nowMs?: number): EnergySnapshot {
+  const now = typeof nowMs === 'number' ? nowMs : Date.now();
+  let energy = Math.max(0, Math.floor(Number(progress?.energy ?? ENERGY_CAP) || 0));
+  let cursorMs = toValidTimeMs(progress?.energy_updated_at || null);
+
+  if (energy < ENERGY_CAP) {
+    const elapsed = Math.max(0, now - cursorMs);
+    const restored = Math.floor(elapsed / ENERGY_RESTORE_MS);
+    if (restored > 0) {
+      const nextEnergy = Math.min(ENERGY_CAP, energy + restored);
+      const appliedRestore = nextEnergy - energy;
+      energy = nextEnergy;
+      cursorMs += appliedRestore * ENERGY_RESTORE_MS;
+    }
+  }
+
+  const nextEnergyAt = energy < ENERGY_CAP ? new Date(cursorMs + ENERGY_RESTORE_MS).toISOString() : null;
+  const secondsToNextEnergy = nextEnergyAt
+    ? Math.max(0, Math.ceil((Date.parse(nextEnergyAt) - now) / 1000))
+    : 0;
+
+  return {
+    energy,
+    energyUpdatedAt: new Date(cursorMs).toISOString(),
+    nextEnergyAt,
+    secondsToNextEnergy,
+    sidebarRewardClaimed: !!progress?.sidebar_reward_claimed
+  };
+}
+
+function persistEnergySnapshot(
+  db: Database.Database,
+  userId: string,
+  snapshot: EnergySnapshot
+) {
+  db.prepare(
+    `UPDATE progress
+     SET energy = ?, energy_updated_at = ?, sidebar_reward_claimed = ?, updated_at = datetime('now')
+     WHERE user_id = ?`
+  ).run(snapshot.energy, snapshot.energyUpdatedAt, snapshot.sidebarRewardClaimed ? 1 : 0, userId);
+}
+
 function mergeProgressForUser(db: Database.Database, targetUserId: string, sourceUserId: string) {
   const targetProgress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(targetUserId) as StoredProgress | null;
   const sourceProgress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(sourceUserId) as StoredProgress | null;
@@ -183,19 +243,39 @@ function mergeProgressForUser(db: Database.Database, targetUserId: string, sourc
   const mergedMilestoneStars = Array.from(new Set([...targetMilestoneStars, ...sourceMilestoneStars])).sort((a, b) => a - b);
   const mergedBonusStars = (targetProgress?.bonus_stars || 0) + (sourceProgress?.bonus_stars || 0);
   const mergedUnlockedLevel = Math.max(targetProgress?.unlocked_level || 1, sourceProgress?.unlocked_level || 1);
+  const targetEnergy = getEnergySnapshot(targetProgress);
+  const sourceEnergy = getEnergySnapshot(sourceProgress);
+  const mergedEnergy = Math.max(targetEnergy.energy, sourceEnergy.energy);
+  const mergedEnergyUpdatedAt = mergedEnergy > ENERGY_CAP
+    ? new Date().toISOString()
+    : (targetEnergy.energy >= sourceEnergy.energy ? targetEnergy.energyUpdatedAt : sourceEnergy.energyUpdatedAt);
+  const mergedSidebarRewardClaimed = !!((targetProgress?.sidebar_reward_claimed || 0) || (sourceProgress?.sidebar_reward_claimed || 0));
   const mergedWinStreak = Math.max(targetProgress?.win_streak || 0, sourceProgress?.win_streak || 0);
 
   db.prepare(
-    `INSERT INTO progress (user_id, unlocked_level, stars, milestone_stars, bonus_stars, win_streak, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+    `INSERT INTO progress (user_id, unlocked_level, stars, milestone_stars, bonus_stars, energy, energy_updated_at, sidebar_reward_claimed, win_streak, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
      ON CONFLICT(user_id) DO UPDATE SET
        unlocked_level = excluded.unlocked_level,
        stars = excluded.stars,
        milestone_stars = excluded.milestone_stars,
        bonus_stars = excluded.bonus_stars,
+       energy = excluded.energy,
+       energy_updated_at = excluded.energy_updated_at,
+       sidebar_reward_claimed = excluded.sidebar_reward_claimed,
        win_streak = excluded.win_streak,
        updated_at = datetime('now')`
-  ).run(targetUserId, mergedUnlockedLevel, JSON.stringify(mergedStars), JSON.stringify(mergedMilestoneStars), mergedBonusStars, mergedWinStreak);
+  ).run(
+    targetUserId,
+    mergedUnlockedLevel,
+    JSON.stringify(mergedStars),
+    JSON.stringify(mergedMilestoneStars),
+    mergedBonusStars,
+    mergedEnergy,
+    mergedEnergyUpdatedAt,
+    mergedSidebarRewardClaimed ? 1 : 0,
+    mergedWinStreak
+  );
 
   db.prepare('DELETE FROM progress WHERE user_id = ?').run(sourceUserId);
 }
@@ -639,12 +719,22 @@ async function startServer() {
       stars: string;
       milestone_stars: string;
       bonus_stars: number;
+      energy: number;
+      energy_updated_at: string | null;
+      sidebar_reward_claimed: number;
       win_streak: number;
     } | null;
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as StoredUser | null;
     const stars = parseStars(progress?.stars);
     const milestoneStars = parseStars(progress?.milestone_stars);
     const bonusStars = progress?.bonus_stars || 0;
+    const energySnapshot = getEnergySnapshot(progress);
+    if (
+      progress &&
+      (progress.energy !== energySnapshot.energy || (progress.energy_updated_at || '') !== energySnapshot.energyUpdatedAt)
+    ) {
+      persistEnergySnapshot(db, userId, energySnapshot);
+    }
 
     return res.json({
       unlockedLevel: progress?.unlocked_level || 1,
@@ -652,6 +742,11 @@ async function startServer() {
       milestoneStars,
       bonusStars,
       starCount: stars.length + milestoneStars.length + Math.max(0, bonusStars || 0),
+      energy: energySnapshot.energy,
+      energyUpdatedAt: energySnapshot.energyUpdatedAt,
+      nextEnergyAt: energySnapshot.nextEnergyAt,
+      secondsToNextEnergy: energySnapshot.secondsToNextEnergy,
+      sidebarRewardClaimed: energySnapshot.sidebarRewardClaimed,
       winStreak: progress?.win_streak || 0,
       isVip: !!user?.is_vip,
       user: user ? buildUserResponse(user) : null,
@@ -667,6 +762,9 @@ async function startServer() {
       stars: string;
       milestone_stars: string;
       bonus_stars: number;
+      energy: number;
+      energy_updated_at: string | null;
+      sidebar_reward_claimed: number;
       win_streak: number;
     } | null;
     const existingStars = parseStars(existingProgress?.stars);
@@ -712,6 +810,7 @@ async function startServer() {
       milestoneStars: mergedMilestoneStars,
       bonusStars: nextBonusStars,
       starCount: totalStars,
+      energy: getEnergySnapshot(existingProgress).energy,
       winStreak: winStreak ?? (existingProgress?.win_streak || 0)
     });
   });
@@ -764,6 +863,108 @@ async function startServer() {
     } catch (error) {
       return res.status(400).json({ error: '今日已签到' });
     }
+  });
+
+  app.post('/api/user/energy/consume', authenticate, async (req: AuthedRequest, res) => {
+    const userId = req.user!.id;
+    const amount = Math.max(1, Math.floor(Number(req.body?.amount || 1)));
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason : 'unknown';
+    const progress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(userId) as StoredProgress | null;
+    const snapshot = getEnergySnapshot(progress);
+
+    if (!progress) {
+      return res.status(404).json({ error: 'progress_not_found' });
+    }
+    if (snapshot.energy < amount) {
+      persistEnergySnapshot(db, userId, snapshot);
+      return res.status(400).json({
+        error: 'insufficient_energy',
+        energy: snapshot.energy,
+        energyUpdatedAt: snapshot.energyUpdatedAt,
+        nextEnergyAt: snapshot.nextEnergyAt,
+        secondsToNextEnergy: snapshot.secondsToNextEnergy
+      });
+    }
+
+    const nextEnergy = snapshot.energy - amount;
+    const shouldRestartRegen = snapshot.energy > ENERGY_CAP && nextEnergy <= ENERGY_CAP;
+    const nextSnapshot: EnergySnapshot = {
+      energy: nextEnergy,
+      energyUpdatedAt: shouldRestartRegen ? new Date().toISOString() : snapshot.energyUpdatedAt,
+      nextEnergyAt: null,
+      secondsToNextEnergy: 0,
+      sidebarRewardClaimed: snapshot.sidebarRewardClaimed
+    };
+    const normalizedNextSnapshot = getEnergySnapshot({
+      energy: nextSnapshot.energy,
+      energy_updated_at: nextSnapshot.energyUpdatedAt,
+      sidebar_reward_claimed: nextSnapshot.sidebarRewardClaimed ? 1 : 0
+    });
+    persistEnergySnapshot(db, userId, normalizedNextSnapshot);
+    db.prepare(
+      'INSERT INTO operation_logs (user_id, action, details, created_at) VALUES (?, ?, ?, datetime(\'now\'))'
+    ).run(userId, 'energy_consume', JSON.stringify({ reason, amount }));
+
+    return res.json({
+      success: true,
+      energy: normalizedNextSnapshot.energy,
+      energyUpdatedAt: normalizedNextSnapshot.energyUpdatedAt,
+      nextEnergyAt: normalizedNextSnapshot.nextEnergyAt,
+      secondsToNextEnergy: normalizedNextSnapshot.secondsToNextEnergy
+    });
+  });
+
+  app.post('/api/user/energy/reward', authenticate, async (req: AuthedRequest, res) => {
+    const userId = req.user!.id;
+    const source = typeof req.body?.source === 'string' ? req.body.source : '';
+    const rewardMap: Record<string, number> = {
+      share: 3,
+      ad: 5,
+      sidebar: 30
+    };
+    const rewardAmount = rewardMap[source];
+    if (!rewardAmount) {
+      return res.status(400).json({ error: 'invalid_source' });
+    }
+
+    const progress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(userId) as StoredProgress | null;
+    if (!progress) {
+      return res.status(404).json({ error: 'progress_not_found' });
+    }
+
+    const snapshot = getEnergySnapshot(progress);
+    if (source === 'sidebar' && snapshot.sidebarRewardClaimed) {
+      return res.status(400).json({ error: 'sidebar_reward_claimed' });
+    }
+
+    const nextEnergy = snapshot.energy + rewardAmount;
+    const nextSnapshot: EnergySnapshot = {
+      energy: nextEnergy,
+      energyUpdatedAt: nextEnergy > ENERGY_CAP ? new Date().toISOString() : snapshot.energyUpdatedAt,
+      nextEnergyAt: null,
+      secondsToNextEnergy: 0,
+      sidebarRewardClaimed: source === 'sidebar' ? true : snapshot.sidebarRewardClaimed
+    };
+    const normalizedNextSnapshot = getEnergySnapshot({
+      energy: nextSnapshot.energy,
+      energy_updated_at: nextSnapshot.energyUpdatedAt,
+      sidebar_reward_claimed: nextSnapshot.sidebarRewardClaimed ? 1 : 0
+    });
+    persistEnergySnapshot(db, userId, normalizedNextSnapshot);
+    db.prepare(
+      'INSERT INTO operation_logs (user_id, action, details, created_at) VALUES (?, ?, ?, datetime(\'now\'))'
+    ).run(userId, 'energy_reward', JSON.stringify({ source, amount: rewardAmount }));
+
+    return res.json({
+      success: true,
+      source,
+      amount: rewardAmount,
+      energy: normalizedNextSnapshot.energy,
+      energyUpdatedAt: normalizedNextSnapshot.energyUpdatedAt,
+      nextEnergyAt: normalizedNextSnapshot.nextEnergyAt,
+      secondsToNextEnergy: normalizedNextSnapshot.secondsToNextEnergy,
+      sidebarRewardClaimed: normalizedNextSnapshot.sidebarRewardClaimed
+    });
   });
 
   app.get('/api/rankings', async (req, res) => {
