@@ -43,6 +43,7 @@ type StoredProgress = {
   user_id: string;
   unlocked_level: number;
   stars: string;
+  milestone_stars: string;
   bonus_stars: number;
   win_streak: number;
 };
@@ -167,8 +168,8 @@ function parseStars(raw: string | null | undefined) {
   }
 }
 
-function getTotalStars(stars: number[], bonusStars: number) {
-  return stars.length + Math.max(0, bonusStars || 0);
+function getTotalStars(stars: number[], milestoneStars: number[], bonusStars: number) {
+  return stars.length + milestoneStars.length + Math.max(0, bonusStars || 0);
 }
 
 function mergeProgressForUser(db: Database.Database, targetUserId: string, sourceUserId: string) {
@@ -176,21 +177,25 @@ function mergeProgressForUser(db: Database.Database, targetUserId: string, sourc
   const sourceProgress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(sourceUserId) as StoredProgress | null;
   const targetStars = parseStars(targetProgress?.stars);
   const sourceStars = parseStars(sourceProgress?.stars);
+  const targetMilestoneStars = parseStars(targetProgress?.milestone_stars);
+  const sourceMilestoneStars = parseStars(sourceProgress?.milestone_stars);
   const mergedStars = Array.from(new Set([...targetStars, ...sourceStars])).sort((a, b) => a - b);
+  const mergedMilestoneStars = Array.from(new Set([...targetMilestoneStars, ...sourceMilestoneStars])).sort((a, b) => a - b);
   const mergedBonusStars = (targetProgress?.bonus_stars || 0) + (sourceProgress?.bonus_stars || 0);
   const mergedUnlockedLevel = Math.max(targetProgress?.unlocked_level || 1, sourceProgress?.unlocked_level || 1);
   const mergedWinStreak = Math.max(targetProgress?.win_streak || 0, sourceProgress?.win_streak || 0);
 
   db.prepare(
-    `INSERT INTO progress (user_id, unlocked_level, stars, bonus_stars, win_streak, updated_at)
-     VALUES (?, ?, ?, ?, ?, datetime('now'))
+    `INSERT INTO progress (user_id, unlocked_level, stars, milestone_stars, bonus_stars, win_streak, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
      ON CONFLICT(user_id) DO UPDATE SET
        unlocked_level = excluded.unlocked_level,
        stars = excluded.stars,
+       milestone_stars = excluded.milestone_stars,
        bonus_stars = excluded.bonus_stars,
        win_streak = excluded.win_streak,
        updated_at = datetime('now')`
-  ).run(targetUserId, mergedUnlockedLevel, JSON.stringify(mergedStars), mergedBonusStars, mergedWinStreak);
+  ).run(targetUserId, mergedUnlockedLevel, JSON.stringify(mergedStars), JSON.stringify(mergedMilestoneStars), mergedBonusStars, mergedWinStreak);
 
   db.prepare('DELETE FROM progress WHERE user_id = ?').run(sourceUserId);
 }
@@ -632,18 +637,21 @@ async function startServer() {
     const progress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(userId) as {
       unlocked_level: number;
       stars: string;
+      milestone_stars: string;
       bonus_stars: number;
       win_streak: number;
     } | null;
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as StoredUser | null;
     const stars = parseStars(progress?.stars);
+    const milestoneStars = parseStars(progress?.milestone_stars);
     const bonusStars = progress?.bonus_stars || 0;
 
     return res.json({
       unlockedLevel: progress?.unlocked_level || 1,
       stars,
+      milestoneStars,
       bonusStars,
-      starCount: getTotalStars(stars, bonusStars),
+      starCount: stars.length + milestoneStars.length + Math.max(0, bonusStars || 0),
       winStreak: progress?.win_streak || 0,
       isVip: !!user?.is_vip,
       user: user ? buildUserResponse(user) : null,
@@ -651,31 +659,38 @@ async function startServer() {
   });
 
   app.post('/api/user/progress', authenticate, async (req: AuthedRequest, res) => {
-    const { unlockedLevel, stars, winStreak, bonusStars } = req.body ?? {};
+    const { unlockedLevel, stars, milestoneStars, winStreak, bonusStars } = req.body ?? {};
     const userId = req.user!.id;
     const today = new Date().toISOString().split('T')[0];
     const existingProgress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(userId) as {
       unlocked_level: number;
       stars: string;
+      milestone_stars: string;
       bonus_stars: number;
       win_streak: number;
     } | null;
     const existingStars = parseStars(existingProgress?.stars);
+    const existingMilestoneStars = parseStars(existingProgress?.milestone_stars);
     const nextStars = Array.isArray(stars) ? stars : [];
     const mergedStars = Array.from(new Set([...existingStars, ...nextStars]))
+      .map((item) => Number(item))
+      .filter((item) => Number.isFinite(item))
+      .sort((a, b) => a - b);
+    const nextMilestoneStars = Array.isArray(milestoneStars) ? milestoneStars : [];
+    const mergedMilestoneStars = Array.from(new Set([...existingMilestoneStars, ...nextMilestoneStars]))
       .map((item) => Number(item))
       .filter((item) => Number.isFinite(item))
       .sort((a, b) => a - b);
     const nextBonusStars = typeof bonusStars === 'number'
       ? Math.max(0, Math.floor(bonusStars))
       : (existingProgress?.bonus_stars || 0);
-    const previousTotalStars = getTotalStars(existingStars, existingProgress?.bonus_stars || 0);
-    const totalStars = getTotalStars(mergedStars, nextBonusStars);
+    const previousTotalStars = existingStars.length + existingMilestoneStars.length + Math.max(0, existingProgress?.bonus_stars || 0);
+    const totalStars = mergedStars.length + mergedMilestoneStars.length + Math.max(0, nextBonusStars || 0);
     const earnedDelta = Math.max(0, totalStars - previousTotalStars);
 
     db.prepare(
-      'UPDATE progress SET unlocked_level = MAX(COALESCE(?, unlocked_level), unlocked_level), stars = ?, bonus_stars = ?, win_streak = COALESCE(?, win_streak), updated_at = datetime(\'now\') WHERE user_id = ?'
-    ).run(unlockedLevel, JSON.stringify(mergedStars), nextBonusStars, winStreak, userId);
+      'UPDATE progress SET unlocked_level = MAX(COALESCE(?, unlocked_level), unlocked_level), stars = ?, milestone_stars = ?, bonus_stars = ?, win_streak = COALESCE(?, win_streak), updated_at = datetime(\'now\') WHERE user_id = ?'
+    ).run(unlockedLevel, JSON.stringify(mergedStars), JSON.stringify(mergedMilestoneStars), nextBonusStars, winStreak, userId);
 
     db.prepare(
       `INSERT INTO rankings (user_id, total_stars, daily_stars, win_streak, last_updated_date)
@@ -694,6 +709,7 @@ async function startServer() {
     return res.json({
       success: true,
       stars: mergedStars,
+      milestoneStars: mergedMilestoneStars,
       bonusStars: nextBonusStars,
       starCount: totalStars,
       winStreak: winStreak ?? (existingProgress?.win_streak || 0)
@@ -719,12 +735,14 @@ async function startServer() {
 
       const progress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(userId) as {
         stars: string;
+        milestone_stars: string;
         bonus_stars: number;
         win_streak: number;
       } | null;
       const stars = parseStars(progress?.stars);
+      const milestoneStars = parseStars(progress?.milestone_stars);
       const nextBonusStars = progress?.bonus_stars || 0;
-      const totalStars = getTotalStars(stars, nextBonusStars);
+      const totalStars = getTotalStars(stars, milestoneStars, nextBonusStars);
 
       db.prepare(
         `INSERT INTO rankings (user_id, total_stars, daily_stars, win_streak, last_updated_date)
