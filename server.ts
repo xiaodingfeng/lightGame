@@ -904,7 +904,7 @@ async function startServer() {
     }
 
     const nextEnergy = snapshot.energy - amount;
-    const shouldRestartRegen = snapshot.energy > ENERGY_CAP && nextEnergy <= ENERGY_CAP;
+    const shouldRestartRegen = snapshot.energy >= ENERGY_CAP && nextEnergy < ENERGY_CAP;
     const nextSnapshot: EnergySnapshot = {
       energy: nextEnergy,
       energyUpdatedAt: shouldRestartRegen ? new Date().toISOString() : snapshot.energyUpdatedAt,
