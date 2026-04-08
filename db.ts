@@ -135,8 +135,11 @@ export function initDb() {
   addColumnIfMissing(db, 'progress', 'milestone_stars', "TEXT NOT NULL DEFAULT '[]'");
   addColumnIfMissing(db, 'progress', 'bonus_stars', 'INTEGER NOT NULL DEFAULT 0');
   addColumnIfMissing(db, 'progress', 'energy', 'INTEGER NOT NULL DEFAULT 10');
-  addColumnIfMissing(db, 'progress', 'energy_updated_at', 'DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP');
+  addColumnIfMissing(db, 'progress', 'energy_updated_at', 'TEXT');
   addColumnIfMissing(db, 'progress', 'sidebar_reward_claimed', 'INTEGER NOT NULL DEFAULT 0');
+  db.prepare("UPDATE progress SET energy = COALESCE(energy, 10) WHERE energy IS NULL").run();
+  db.prepare("UPDATE progress SET energy_updated_at = COALESCE(NULLIF(energy_updated_at, ''), datetime('now')) WHERE energy_updated_at IS NULL OR energy_updated_at = ''").run();
+  db.prepare("UPDATE progress SET sidebar_reward_claimed = COALESCE(sidebar_reward_claimed, 0) WHERE sidebar_reward_claimed IS NULL").run();
 
   console.log('[db] initialized');
   return db;
