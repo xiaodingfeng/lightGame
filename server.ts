@@ -1,4 +1,4 @@
-import crypto from 'node:crypto';
+﻿import crypto from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
 import express, { type NextFunction, type Request, type Response } from 'express';
@@ -636,7 +636,7 @@ async function startServer() {
     const token = authHeader?.split(' ')[1];
 
     if (!token) {
-      return res.status(401).json({ error: '未登�? });
+      return res.status(401).json({ error: '未登录' });
     }
 
     jwt.verify(token, JWT_SECRET, (err, decoded) => {
@@ -661,7 +661,7 @@ async function startServer() {
       xTtOpenId: typeof req.headers['x-tt-openid'] === 'string' ? maskValue(req.headers['x-tt-openid']) : ''
     });
     if ((!code || typeof code !== 'string') && (!anonymousCode || typeof anonymousCode !== 'string')) {
-      return res.status(400).json({ error: 'code �?anonymousCode 至少传一�? });
+      return res.status(400).json({ error: 'code 或 anonymousCode 至少传一个' });
     }
 
     let session: SessionResult;
@@ -707,14 +707,14 @@ async function startServer() {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown error';
-      return res.status(500).json({ error: '用户初始化失�?, detail: message });
+      return res.status(500).json({ error: '用户初始化失败', detail: message });
     }
   });
 
   app.get('/api/auth/me', authenticate, async (req: AuthedRequest, res) => {
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user!.id) as StoredUser | null;
     if (!user) {
-      return res.status(404).json({ error: '用户不存�? });
+      return res.status(404).json({ error: '用户不存在' });
     }
     return res.json({ user: buildUserResponse(user) });
   });
@@ -723,7 +723,7 @@ async function startServer() {
     const { userInfo, rawData, signature, encryptedData, iv, appId } = req.body ?? {};
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user!.id) as (StoredUser & { session_key: string | null }) | null;
     if (!user) {
-      return res.status(404).json({ error: '用户不存�? });
+      return res.status(404).json({ error: '用户不存在' });
     }
 
     let profileVerified = false;
@@ -788,7 +788,7 @@ async function startServer() {
   app.get('/api/user/profile', authenticate, async (req: AuthedRequest, res) => {
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user!.id) as StoredUser | null;
     if (!user) {
-      return res.status(404).json({ error: '用户不存�? });
+      return res.status(404).json({ error: '用户不存在' });
     }
     return res.json({ user: buildUserResponse(user) });
   });
@@ -942,7 +942,7 @@ async function startServer() {
         starCount: totalStars
       });
     } catch (error) {
-      return res.status(400).json({ error: '今日已签�? });
+      return res.status(400).json({ error: '今日已签到' });
     }
   });
 
@@ -1115,7 +1115,7 @@ async function startServer() {
   app.post('/api/pay/createOrder', authenticate, async (req: AuthedRequest, res) => {
     const { price, description } = req.body ?? {};
     if (!price || !description) {
-      return res.status(400).json({ error: '参数缺失' });
+      return res.status(400).json({ error: '鍙傛暟缂哄け' });
     }
 
     const outOrderNo = `LR_${Date.now()}_${req.user!.id.slice(0, 8)}`;
@@ -1156,7 +1156,7 @@ async function startServer() {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown error';
-      return res.status(500).json({ error: '创建订单失败', detail: message });
+      return res.status(500).json({ error: '鍒涘缓璁㈠崟澶辫触', detail: message });
     }
   });
 
@@ -1164,14 +1164,14 @@ async function startServer() {
     const { timestamp, nonce, msg, msg_signature: signature } = req.body ?? {};
     const computedSign = generatePaySign({ timestamp, nonce, msg });
     if (computedSign !== signature) {
-      return res.json({ err_no: -1, err_tips: '签名错误' });
+      return res.json({ err_no: -1, err_tips: '绛惧悕閿欒' });
     }
 
     let msgData: { cp_orderno?: string; payment_status?: number };
     try {
       msgData = JSON.parse(msg);
     } catch {
-      return res.json({ err_no: -1, err_tips: '消息解析失败' });
+      return res.json({ err_no: -1, err_tips: '娑堟伅瑙ｆ瀽澶辫触' });
     }
 
     const outOrderNo = msgData.cp_orderno;
