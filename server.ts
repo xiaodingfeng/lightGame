@@ -187,6 +187,74 @@ function getTotalStars(stars: number[], milestoneStars: number[], bonusStars: nu
   return stars.length + milestoneStars.length + Math.max(0, bonusStars || 0);
 }
 
+function getRankingList(db: Database.Database, type?: string | null) {
+  const today = new Date().toISOString().split('T')[0];
+  if (type === 'daily') {
+    return db.prepare(`
+      SELECT u.nickname, u.avatar_url, r.daily_stars as score
+      FROM rankings r
+      JOIN users u ON r.user_id = u.id
+      WHERE r.last_updated_date = ?
+      ORDER BY r.daily_stars DESC LIMIT 50`).all(today);
+  }
+  if (type === 'streak') {
+    return db.prepare(`
+      SELECT u.nickname, u.avatar_url, r.win_streak as score
+      FROM rankings r
+      JOIN users u ON r.user_id = u.id
+      ORDER BY r.win_streak DESC LIMIT 50`).all();
+  }
+  return db.prepare(`
+    SELECT u.nickname, u.avatar_url, r.total_stars as score
+    FROM rankings r
+    JOIN users u ON r.user_id = u.id
+    ORDER BY r.total_stars DESC LIMIT 50`).all();
+}
+
+function buildProgressResponse(
+  db: Database.Database,
+  userId: string,
+  progress?: StoredProgress | null,
+  user?: StoredUser | null
+) {
+  const resolvedProgress = typeof progress === 'undefined'
+    ? (db.prepare('SELECT * FROM progress WHERE user_id = ?').get(userId) as StoredProgress | null)
+    : progress;
+  const resolvedUser = typeof user === 'undefined'
+    ? (db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as StoredUser | null)
+    : user;
+  const stars = parseStars(resolvedProgress?.stars);
+  const milestoneStars = parseStars(resolvedProgress?.milestone_stars);
+  const energyPaidLevels = parseStars(resolvedProgress?.energy_paid_levels);
+  const bonusStars = resolvedProgress?.bonus_stars || 0;
+  const energySnapshot = getEnergySnapshot(resolvedProgress);
+
+  if (
+    resolvedProgress &&
+    (resolvedProgress.energy !== energySnapshot.energy || (resolvedProgress.energy_updated_at || '') !== energySnapshot.energyUpdatedAt)
+  ) {
+    persistEnergySnapshot(db, userId, energySnapshot);
+  }
+
+  return {
+    unlockedLevel: resolvedProgress?.unlocked_level || 1,
+    stars,
+    milestoneStars,
+    bonusStars,
+    lastPlayedLevel: resolvedProgress?.last_played_level || 1,
+    starCount: stars.length + milestoneStars.length + Math.max(0, bonusStars || 0),
+    energy: energySnapshot.energy,
+    energyUpdatedAt: energySnapshot.energyUpdatedAt,
+    energyPaidLevels,
+    nextEnergyAt: energySnapshot.nextEnergyAt,
+    secondsToNextEnergy: energySnapshot.secondsToNextEnergy,
+    sidebarRewardClaimed: energySnapshot.sidebarRewardClaimed,
+    winStreak: resolvedProgress?.win_streak || 0,
+    isVip: !!resolvedUser?.is_vip,
+    user: resolvedUser ? buildUserResponse(resolvedUser) : null,
+  };
+}
+
 function toValidTimeMs(raw?: string | null) {
   const time = raw ? Date.parse(raw) : NaN;
   return Number.isFinite(time) ? time : Date.now();
@@ -568,7 +636,7 @@ async function startServer() {
     const token = authHeader?.split(' ')[1];
 
     if (!token) {
-      return res.status(401).json({ error: '未登录' });
+      return res.status(401).json({ error: '未登�? });
     }
 
     jwt.verify(token, JWT_SECRET, (err, decoded) => {
@@ -593,7 +661,7 @@ async function startServer() {
       xTtOpenId: typeof req.headers['x-tt-openid'] === 'string' ? maskValue(req.headers['x-tt-openid']) : ''
     });
     if ((!code || typeof code !== 'string') && (!anonymousCode || typeof anonymousCode !== 'string')) {
-      return res.status(400).json({ error: 'code 或 anonymousCode 至少传一个' });
+      return res.status(400).json({ error: 'code �?anonymousCode 至少传一�? });
     }
 
     let session: SessionResult;
@@ -639,14 +707,14 @@ async function startServer() {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown error';
-      return res.status(500).json({ error: '用户初始化失败', detail: message });
+      return res.status(500).json({ error: '用户初始化失�?, detail: message });
     }
   });
 
   app.get('/api/auth/me', authenticate, async (req: AuthedRequest, res) => {
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user!.id) as StoredUser | null;
     if (!user) {
-      return res.status(404).json({ error: '用户不存在' });
+      return res.status(404).json({ error: '用户不存�? });
     }
     return res.json({ user: buildUserResponse(user) });
   });
@@ -655,7 +723,7 @@ async function startServer() {
     const { userInfo, rawData, signature, encryptedData, iv, appId } = req.body ?? {};
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user!.id) as (StoredUser & { session_key: string | null }) | null;
     if (!user) {
-      return res.status(404).json({ error: '用户不存在' });
+      return res.status(404).json({ error: '用户不存�? });
     }
 
     let profileVerified = false;
@@ -720,55 +788,37 @@ async function startServer() {
   app.get('/api/user/profile', authenticate, async (req: AuthedRequest, res) => {
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user!.id) as StoredUser | null;
     if (!user) {
-      return res.status(404).json({ error: '用户不存在' });
+      return res.status(404).json({ error: '用户不存�? });
     }
     return res.json({ user: buildUserResponse(user) });
   });
 
+  app.get('/api/bootstrap', authenticate, async (req: AuthedRequest, res) => {
+    const userId = req.user!.id;
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as StoredUser | null;
+    if (!user) {
+      return res.status(404).json({ error: 'user_not_found' });
+    }
+    const progress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(userId) as StoredProgress | null;
+    const today = new Date().toISOString().split('T')[0];
+    const checkin = db.prepare('SELECT 1 FROM checkins WHERE user_id = ? AND checkin_date = ?').get(userId, today);
+    return res.json(Object.assign(
+      {},
+      buildProgressResponse(db, userId, progress, user),
+      {
+        checkedIn: !!checkin,
+        rankings: {
+          total: getRankingList(db, 'total'),
+          daily: getRankingList(db, 'daily'),
+          streak: getRankingList(db, 'streak')
+        }
+      }
+    ));
+  });
+
   app.get('/api/user/progress', authenticate, async (req: AuthedRequest, res) => {
     const userId = req.user!.id;
-    const progress = db.prepare('SELECT * FROM progress WHERE user_id = ?').get(userId) as {
-      unlocked_level: number;
-      stars: string;
-      milestone_stars: string;
-      bonus_stars: number;
-      last_played_level: number;
-      energy: number;
-      energy_updated_at: string | null;
-      energy_paid_levels: string;
-      sidebar_reward_claimed: number;
-      win_streak: number;
-    } | null;
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as StoredUser | null;
-    const stars = parseStars(progress?.stars);
-    const milestoneStars = parseStars(progress?.milestone_stars);
-    const energyPaidLevels = parseStars(progress?.energy_paid_levels);
-    const bonusStars = progress?.bonus_stars || 0;
-    const energySnapshot = getEnergySnapshot(progress);
-    if (
-      progress &&
-      (progress.energy !== energySnapshot.energy || (progress.energy_updated_at || '') !== energySnapshot.energyUpdatedAt)
-    ) {
-      persistEnergySnapshot(db, userId, energySnapshot);
-    }
-
-    return res.json({
-      unlockedLevel: progress?.unlocked_level || 1,
-      stars,
-      milestoneStars,
-      bonusStars,
-      lastPlayedLevel: progress?.last_played_level || 1,
-      starCount: stars.length + milestoneStars.length + Math.max(0, bonusStars || 0),
-      energy: energySnapshot.energy,
-      energyUpdatedAt: energySnapshot.energyUpdatedAt,
-      energyPaidLevels,
-      nextEnergyAt: energySnapshot.nextEnergyAt,
-      secondsToNextEnergy: energySnapshot.secondsToNextEnergy,
-      sidebarRewardClaimed: energySnapshot.sidebarRewardClaimed,
-      winStreak: progress?.win_streak || 0,
-      isVip: !!user?.is_vip,
-      user: user ? buildUserResponse(user) : null,
-    });
+    return res.json(buildProgressResponse(db, userId));
   });
 
   app.post('/api/user/progress', authenticate, async (req: AuthedRequest, res) => {
@@ -892,7 +942,7 @@ async function startServer() {
         starCount: totalStars
       });
     } catch (error) {
-      return res.status(400).json({ error: '今日已签到' });
+      return res.status(400).json({ error: '今日已签�? });
     }
   });
 
@@ -999,31 +1049,8 @@ async function startServer() {
   });
 
   app.get('/api/rankings', async (req, res) => {
-    const { type } = req.query;
-    const today = new Date().toISOString().split('T')[0];
-
-    let list = [];
-    if (type === 'daily') {
-      list = db.prepare(`
-        SELECT u.nickname, u.avatar_url, r.daily_stars as score
-        FROM rankings r
-        JOIN users u ON r.user_id = u.id
-        WHERE r.last_updated_date = ?
-        ORDER BY r.daily_stars DESC LIMIT 50`).all(today);
-    } else if (type === 'streak') {
-      list = db.prepare(`
-        SELECT u.nickname, u.avatar_url, r.win_streak as score
-        FROM rankings r
-        JOIN users u ON r.user_id = u.id
-        ORDER BY r.win_streak DESC LIMIT 50`).all();
-    } else {
-      list = db.prepare(`
-        SELECT u.nickname, u.avatar_url, r.total_stars as score
-        FROM rankings r
-        JOIN users u ON r.user_id = u.id
-        ORDER BY r.total_stars DESC LIMIT 50`).all();
-    }
-
+    const type = typeof req.query.type === 'string' ? req.query.type : 'total';
+    const list = getRankingList(db, type);
     return res.json({ list });
   });
 
@@ -1056,6 +1083,33 @@ async function startServer() {
     const { action, details } = req.body ?? {};
     db.prepare('INSERT INTO operation_logs (user_id, action, details, created_at) VALUES (?, ?, ?, datetime(\'now\'))').run(req.user!.id, action, JSON.stringify(details || {}));
     return res.json({ success: true });
+  });
+
+  app.post('/api/user/logs/batch', authenticate, async (req: AuthedRequest, res) => {
+    const logs = Array.isArray(req.body?.logs) ? req.body.logs.slice(0, 20) : [];
+    if (!logs.length) {
+      return res.json({ success: true, count: 0 });
+    }
+
+    const insert = db.prepare(
+      'INSERT INTO operation_logs (user_id, action, details, created_at) VALUES (?, ?, ?, ?)'
+    );
+    const writeLogs = db.transaction((items: Array<{ action?: unknown; details?: unknown; createdAt?: unknown }>) => {
+      items.forEach((item) => {
+        if (!item || typeof item.action !== 'string' || !item.action) {
+          return;
+        }
+        insert.run(
+          req.user!.id,
+          item.action,
+          JSON.stringify(item.details || {}),
+          typeof item.createdAt === 'string' ? item.createdAt : new Date().toISOString()
+        );
+      });
+    });
+
+    writeLogs(logs);
+    return res.json({ success: true, count: logs.length });
   });
 
   app.post('/api/pay/createOrder', authenticate, async (req: AuthedRequest, res) => {
