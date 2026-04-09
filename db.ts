@@ -59,6 +59,7 @@ export function initDb() {
       stars TEXT NOT NULL DEFAULT '[]',
       milestone_stars TEXT NOT NULL DEFAULT '[]',
       bonus_stars INTEGER NOT NULL DEFAULT 0,
+      last_played_level INTEGER NOT NULL DEFAULT 1,
       energy INTEGER NOT NULL DEFAULT 10,
       energy_updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       energy_paid_levels TEXT NOT NULL DEFAULT '[]',
@@ -135,11 +136,13 @@ export function initDb() {
   createIndexIfMissing(db, 'idx_users_anonymous_openid_unique', 'CREATE UNIQUE INDEX idx_users_anonymous_openid_unique ON users(anonymous_openid)');
   addColumnIfMissing(db, 'progress', 'milestone_stars', "TEXT NOT NULL DEFAULT '[]'");
   addColumnIfMissing(db, 'progress', 'bonus_stars', 'INTEGER NOT NULL DEFAULT 0');
+  addColumnIfMissing(db, 'progress', 'last_played_level', 'INTEGER NOT NULL DEFAULT 1');
   addColumnIfMissing(db, 'progress', 'energy', 'INTEGER NOT NULL DEFAULT 10');
   addColumnIfMissing(db, 'progress', 'energy_updated_at', 'TEXT');
   addColumnIfMissing(db, 'progress', 'energy_paid_levels', "TEXT NOT NULL DEFAULT '[]'");
   addColumnIfMissing(db, 'progress', 'sidebar_reward_claimed', 'INTEGER NOT NULL DEFAULT 0');
   db.prepare("UPDATE progress SET energy = COALESCE(energy, 10) WHERE energy IS NULL").run();
+  db.prepare("UPDATE progress SET last_played_level = COALESCE(last_played_level, unlocked_level, 1) WHERE last_played_level IS NULL").run();
   db.prepare("UPDATE progress SET energy_updated_at = COALESCE(NULLIF(energy_updated_at, ''), datetime('now')) WHERE energy_updated_at IS NULL OR energy_updated_at = ''").run();
   db.prepare("UPDATE progress SET energy_paid_levels = COALESCE(NULLIF(energy_paid_levels, ''), '[]') WHERE energy_paid_levels IS NULL OR energy_paid_levels = ''").run();
   db.prepare("UPDATE progress SET sidebar_reward_claimed = COALESCE(sidebar_reward_claimed, 0) WHERE sidebar_reward_claimed IS NULL").run();
