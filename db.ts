@@ -109,6 +109,19 @@ export function initDb() {
       FOREIGN KEY (user_id) REFERENCES users(id)
     );
 
+    CREATE TABLE IF NOT EXISTS subscribe_records (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      template_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'unknown',
+      always_subscribe INTEGER NOT NULL DEFAULT 0,
+      reminder_statuses TEXT NOT NULL DEFAULT '[]',
+      scene TEXT,
+      raw_payload TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS operation_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id TEXT,
@@ -146,6 +159,7 @@ export function initDb() {
   db.prepare("UPDATE progress SET energy_updated_at = COALESCE(NULLIF(energy_updated_at, ''), datetime('now')) WHERE energy_updated_at IS NULL OR energy_updated_at = ''").run();
   db.prepare("UPDATE progress SET energy_paid_levels = COALESCE(NULLIF(energy_paid_levels, ''), '[]') WHERE energy_paid_levels IS NULL OR energy_paid_levels = ''").run();
   db.prepare("UPDATE progress SET sidebar_reward_claimed = COALESCE(sidebar_reward_claimed, 0) WHERE sidebar_reward_claimed IS NULL").run();
+  createIndexIfMissing(db, 'idx_subscribe_records_user_created_at', 'CREATE INDEX idx_subscribe_records_user_created_at ON subscribe_records(user_id, created_at DESC)');
 
   console.log('[db] initialized');
   return db;

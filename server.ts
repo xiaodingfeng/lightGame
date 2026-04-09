@@ -1079,6 +1079,46 @@ async function startServer() {
     return res.json({ success: true });
   });
 
+  app.post('/api/user/subscribeMessage', authenticate, async (req: AuthedRequest, res) => {
+    const templateIds = Array.isArray(req.body?.tmplIds)
+      ? req.body.tmplIds.filter((item: unknown) => typeof item === 'string' && item)
+      : [];
+    const templateSettings = req.body?.templateSettings && typeof req.body.templateSettings === 'object'
+      ? req.body.templateSettings as Record<string, { status?: string; alwaysSubscribe?: boolean; allowReminderWayArray?: unknown[] }>
+      : {};
+    const scene = typeof req.body?.scene === 'string' ? req.body.scene : null;
+    const rawPayload = req.body?.raw && typeof req.body.raw === 'object' ? req.body.raw : null;
+    const ids = templateIds.length ? templateIds : Object.keys(templateSettings);
+
+    if (!ids.length) {
+      return res.status(400).json({ error: 'missing_template_ids' });
+    }
+
+    const insert = db.prepare(`
+      INSERT INTO subscribe_records (
+        user_id, template_id, status, always_subscribe, reminder_statuses, scene, raw_payload, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    `);
+
+    const writeSubscribeRecords = db.transaction((items: string[]) => {
+      items.forEach((templateId) => {
+        const entry = templateSettings[templateId] || {};
+        insert.run(
+          req.user!.id,
+          templateId,
+          typeof entry.status === 'string' ? entry.status : 'unknown',
+          entry.alwaysSubscribe ? 1 : 0,
+          JSON.stringify(Array.isArray(entry.allowReminderWayArray) ? entry.allowReminderWayArray : []),
+          scene,
+          JSON.stringify(rawPayload || entry || {})
+        );
+      });
+    });
+
+    writeSubscribeRecords(ids);
+    return res.json({ success: true, count: ids.length });
+  });
+
   app.post('/api/user/log', authenticate, async (req: AuthedRequest, res) => {
     const { action, details } = req.body ?? {};
     db.prepare('INSERT INTO operation_logs (user_id, action, details, created_at) VALUES (?, ?, ?, datetime(\'now\'))').run(req.user!.id, action, JSON.stringify(details || {}));
