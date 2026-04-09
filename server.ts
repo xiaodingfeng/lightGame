@@ -16,6 +16,7 @@ type JwtUser = {
 
 type AuthedRequest = Request & {
   user?: JwtUser;
+  rawBody?: string;
 };
 
 type SessionResult = {
@@ -74,6 +75,18 @@ const DOUYIN_APP_SECRET =
   process.env.DOUYIN_APPSECREAT ||
   '';
 const DOUYIN_PAY_SALT = process.env.DOUYIN_PAY_SALT || process.env.PAY_SALT || '';
+const DOUYIN_PLATFORM_PUBLIC_KEY =
+  process.env.DOUYIN_PLATFORM_PUBLIC_KEY ||
+  process.env.BYTE_PLATFORM_PUBLIC_KEY ||
+  '';
+const DOUYIN_APP_PRIVATE_KEY =
+  process.env.DOUYIN_APP_PRIVATE_KEY ||
+  process.env.BYTE_APP_PRIVATE_KEY ||
+  '';
+const DOUYIN_APP_KEY_VERSION =
+  process.env.DOUYIN_APP_KEY_VERSION ||
+  process.env.BYTE_APP_KEY_VERSION ||
+  '1';
 const IS_CLOUD = process.env.DOUYIN_CLOUD === 'true';
 const DEFAULT_PORT = IS_CLOUD ? '8000' : '3000';
 const PORT = Number.parseInt(process.env.PORT || DEFAULT_PORT, 10);
@@ -81,6 +94,101 @@ const PUBLIC_DIR = process.env.PUBLIC_DIR || path.join(process.cwd(), 'public');
 const IS_DEV = process.env.NODE_ENV !== 'production' || !DOUYIN_APP_SECRET;
 const ENERGY_RESTORE_MS = 5 * 60 * 1000;
 const ENERGY_CAP = 10;
+const PAYMENT_PRODUCTS: Record<string, { productId: string; orderAmount: number; goodName: string; grantType: string }> = {
+  unlock_all_levels: {
+    productId: 'unlock_all_levels',
+    orderAmount: 990,
+    goodName: '解锁全关卡',
+    grantType: 'vip_unlock_all'
+  }
+};
+
+function getProductById(productId?: string | null) {
+  if (!productId) return null;
+  return PAYMENT_PRODUCTS[productId] || null;
+}
+
+function getProductByCustomId(customId?: string | null) {
+  if (!customId) return null;
+  const entries = Object.values(PAYMENT_PRODUCTS);
+  for (let i = 0; i < entries.length; i += 1) {
+    const product = entries[i];
+    if (customId === product.productId || customId.startsWith(`${product.productId}_`)) {
+      return product;
+    }
+  }
+  return null;
+}
+
+function verifyPaymentCallbackSignature(rawBody: string, timestamp: string, nonce: string, signature: string) {
+  if (!DOUYIN_PLATFORM_PUBLIC_KEY) {
+    return false;
+  }
+  const verifier = crypto.createVerify('RSA-SHA256');
+  verifier.update(`${timestamp}\n${nonce}\n${rawBody}\n`, 'utf8');
+  verifier.end();
+  return verifier.verify(DOUYIN_PLATFORM_PUBLIC_KEY, signature, 'base64');
+}
+
+function canQueryPaymentOrder() {
+  return !!(MINI_GAME_APP_ID && DOUYIN_APP_PRIVATE_KEY && DOUYIN_APP_KEY_VERSION);
+}
+
+function buildOpenApiAuthorization(method: string, apiPath: string, bodyText: string, timestamp: string, nonce: string) {
+  const signer = crypto.createSign('RSA-SHA256');
+  signer.update(`${method.toUpperCase()}\n${apiPath}\n${timestamp}\n${nonce}\n${bodyText}\n`, 'utf8');
+  signer.end();
+  const signature = signer.sign(DOUYIN_APP_PRIVATE_KEY, 'base64');
+  return `SHA256-RSA2048 appid="${MINI_GAME_APP_ID}",nonce_str="${nonce}",timestamp="${timestamp}",key_version="${DOUYIN_APP_KEY_VERSION}",signature="${signature}"`;
+}
+
+function verifyOpenApiResponseSignature(rawBody: string, timestamp: string, nonce: string, signature: string) {
+  if (!DOUYIN_PLATFORM_PUBLIC_KEY || !signature) {
+    return false;
+  }
+  const verifier = crypto.createVerify('RSA-SHA256');
+  verifier.update(`${timestamp}\n${nonce}\n${rawBody}\n`, 'utf8');
+  verifier.end();
+  return verifier.verify(DOUYIN_PLATFORM_PUBLIC_KEY, signature, 'base64');
+}
+
+async function queryPaymentOrderByOutOrderNo(outOrderNo: string) {
+  if (!outOrderNo || !canQueryPaymentOrder()) {
+    return null;
+  }
+  const apiPath = '/api/apps/trade/v2/query_order';
+  const url = `https://developer.toutiao.com${apiPath}`;
+  const body = JSON.stringify({ out_order_no: outOrderNo });
+  const timestamp = `${Math.floor(Date.now() / 1000)}`;
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const authorization = buildOpenApiAuthorization('POST', apiPath, body, timestamp, nonce);
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Byte-Authorization': authorization
+    },
+    body
+  });
+  const rawText = await response.text();
+  const responseTimestamp = response.headers.get('Byte-Timestamp') || '';
+  const responseNonce = response.headers.get('Byte-Nonce-Str') || '';
+  const responseSignature = response.headers.get('Byte-Signature') || '';
+
+  if (DOUYIN_PLATFORM_PUBLIC_KEY && responseSignature) {
+    const verified = verifyOpenApiResponseSignature(rawText, responseTimestamp, responseNonce, responseSignature);
+    if (!verified) {
+      throw new Error('query_order response signature invalid');
+    }
+  }
+
+  const json = JSON.parse(rawText);
+  if (!response.ok || json.err_no !== 0) {
+    throw new Error(`query_order failed: ${json.err_tips || response.statusText || 'unknown error'}`);
+  }
+  return json.data || null;
+}
 
 function safeLogBody(body: unknown) {
   if (!body || typeof body !== 'object') {
@@ -253,6 +361,73 @@ function buildProgressResponse(
     isVip: !!resolvedUser?.is_vip,
     user: resolvedUser ? buildUserResponse(resolvedUser) : null,
   };
+}
+
+function fulfillPurchaseRecord(
+  db: Database.Database,
+  params: {
+    userId: string;
+    productId: string;
+    customId: string;
+    orderAmount: number;
+    goodName: string;
+    grantType: string;
+    platform?: string | null;
+    paymentPayload?: unknown;
+    paymentResult?: unknown;
+    status?: string;
+  }
+) {
+  const existing = db.prepare(
+    'SELECT status FROM purchase_records WHERE user_id = ? AND custom_id = ?'
+  ).get(params.userId, params.customId) as { status: string } | null;
+
+  if (!existing) {
+    db.prepare(`
+      INSERT INTO purchase_records (
+        user_id, product_id, grant_type, custom_id, order_amount, good_name, platform, status, payment_payload, payment_result, fulfilled_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), datetime('now'))
+    `).run(
+      params.userId,
+      params.productId,
+      params.grantType,
+      params.customId,
+      params.orderAmount,
+      params.goodName,
+      params.platform || null,
+      params.status || 'paid',
+      JSON.stringify(params.paymentPayload || {}),
+      JSON.stringify(params.paymentResult || {})
+    );
+  } else {
+    db.prepare(`
+      UPDATE purchase_records
+      SET product_id = ?, grant_type = ?, order_amount = ?, good_name = ?, platform = ?,
+          status = ?, payment_payload = ?, payment_result = ?, fulfilled_at = datetime('now'), updated_at = datetime('now')
+      WHERE user_id = ? AND custom_id = ?
+    `).run(
+      params.productId,
+      params.grantType,
+      params.orderAmount,
+      params.goodName,
+      params.platform || null,
+      params.status || 'paid',
+      JSON.stringify(params.paymentPayload || {}),
+      JSON.stringify(params.paymentResult || {}),
+      params.userId,
+      params.customId
+    );
+  }
+
+  if (params.grantType === 'vip_unlock_all') {
+    db.prepare('UPDATE users SET is_vip = 1, updated_at = datetime(\'now\') WHERE id = ?').run(params.userId);
+  }
+
+  db.prepare(
+    'UPDATE purchase_records SET status = ?, fulfilled_at = datetime(\'now\'), updated_at = datetime(\'now\') WHERE user_id = ? AND custom_id = ?'
+  ).run('fulfilled', params.userId, params.customId);
+
+  return db.prepare('SELECT * FROM users WHERE id = ?').get(params.userId) as StoredUser | null;
 }
 
 function toValidTimeMs(raw?: string | null) {
@@ -573,7 +748,12 @@ async function startServer() {
   const app = express();
   const db = initDb();
 
-  app.use(express.json({ limit: '1mb' }));
+  app.use(express.json({
+    limit: '1mb',
+    verify(req, _res, buf) {
+      (req as AuthedRequest).rawBody = buf.toString('utf8');
+    }
+  }));
   app.use((req, res, next) => {
     const requestId = crypto.randomUUID().slice(0, 8);
     const startAt = Date.now();
@@ -1119,6 +1299,123 @@ async function startServer() {
     return res.json({ success: true, count: ids.length });
   });
 
+  app.post('/api/purchase/fulfill', authenticate, async (req: AuthedRequest, res) => {
+    const productId = typeof req.body?.productId === 'string' ? req.body.productId : '';
+    const customId = typeof req.body?.customId === 'string' ? req.body.customId : '';
+    const platform = typeof req.body?.platform === 'string' ? req.body.platform : '';
+    const paymentPayload = req.body?.paymentPayload && typeof req.body.paymentPayload === 'object' ? req.body.paymentPayload : null;
+    const paymentResult = req.body?.paymentResult && typeof req.body.paymentResult === 'object' ? req.body.paymentResult : null;
+    const product = getProductById(productId);
+
+    if (!product || !customId) {
+      return res.status(400).json({ success: false, error: 'invalid_purchase_payload' });
+    }
+
+    let orderQuery: any = null;
+    if (canQueryPaymentOrder()) {
+      try {
+        orderQuery = await queryPaymentOrderByOutOrderNo(customId);
+      } catch (error) {
+        return res.status(502).json({
+          success: false,
+          error: 'query_order_failed',
+          detail: error instanceof Error ? error.message : String(error)
+        });
+      }
+
+      const orderStatus = typeof orderQuery?.order_status === 'string' ? orderQuery.order_status : '';
+      if (orderStatus && orderStatus !== 'SUCCESS') {
+        return res.status(409).json({
+          success: false,
+          error: 'order_not_paid',
+          orderStatus,
+          orderQuery
+        });
+      }
+    }
+
+    const dbUser = fulfillPurchaseRecord(db, {
+      userId: req.user!.id,
+      productId: product.productId,
+      customId,
+      orderAmount: product.orderAmount,
+      goodName: product.goodName,
+      grantType: product.grantType,
+      platform,
+      paymentPayload,
+      paymentResult: orderQuery || paymentResult,
+      status: 'paid_client_callback'
+    });
+    return res.json({
+      success: true,
+      productId: product.productId,
+      customId,
+      grantType: product.grantType,
+      orderQuery,
+      user: dbUser ? buildUserResponse(dbUser) : null
+    });
+  });
+
+  app.post('/api/purchase/query', authenticate, async (req: AuthedRequest, res) => {
+    const customId = typeof req.body?.customId === 'string' ? req.body.customId : '';
+    if (!customId) {
+      return res.status(400).json({ success: false, error: 'missing_custom_id' });
+    }
+    if (!canQueryPaymentOrder()) {
+      return res.status(400).json({ success: false, error: 'query_order_not_configured' });
+    }
+    try {
+      const data = await queryPaymentOrderByOutOrderNo(customId);
+      return res.json({ success: true, data });
+    } catch (error) {
+      return res.status(502).json({
+        success: false,
+        error: 'query_order_failed',
+        detail: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
+
+  app.post('/api/purchase/prepare', authenticate, async (req: AuthedRequest, res) => {
+    const productId = typeof req.body?.productId === 'string' ? req.body.productId : '';
+    const customId = typeof req.body?.customId === 'string' ? req.body.customId : '';
+    const platform = typeof req.body?.platform === 'string' ? req.body.platform : '';
+    const paymentPayload = req.body?.paymentPayload && typeof req.body.paymentPayload === 'object' ? req.body.paymentPayload : null;
+    const product = getProductById(productId);
+
+    if (!product || !customId) {
+      return res.status(400).json({ success: false, error: 'invalid_purchase_payload' });
+    }
+
+    db.prepare(`
+      INSERT INTO purchase_records (
+        user_id, product_id, grant_type, custom_id, order_amount, good_name, platform, status, payment_payload, payment_result, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+      ON CONFLICT(user_id, custom_id) DO UPDATE SET
+        product_id = excluded.product_id,
+        grant_type = excluded.grant_type,
+        order_amount = excluded.order_amount,
+        good_name = excluded.good_name,
+        platform = excluded.platform,
+        status = excluded.status,
+        payment_payload = excluded.payment_payload,
+        updated_at = datetime('now')
+    `).run(
+      req.user!.id,
+      product.productId,
+      product.grantType,
+      customId,
+      product.orderAmount,
+      product.goodName,
+      platform || null,
+      'created',
+      JSON.stringify(paymentPayload || {}),
+      JSON.stringify({})
+    );
+
+    return res.json({ success: true, productId: product.productId, customId });
+  });
+
   app.post('/api/user/log', authenticate, async (req: AuthedRequest, res) => {
     const { action, details } = req.body ?? {};
     db.prepare('INSERT INTO operation_logs (user_id, action, details, created_at) VALUES (?, ?, ?, datetime(\'now\'))').run(req.user!.id, action, JSON.stringify(details || {}));
@@ -1201,29 +1498,92 @@ async function startServer() {
   });
 
   app.post('/api/pay/callback', async (req, res) => {
-    const { timestamp, nonce, msg, msg_signature: signature } = req.body ?? {};
-    const computedSign = generatePaySign({ timestamp, nonce, msg });
-    if (computedSign !== signature) {
-      return res.json({ err_no: -1, err_tips: '绛惧悕閿欒' });
-    }
+    const rawBody = (req as AuthedRequest).rawBody || JSON.stringify(req.body || {});
+    const timestamp = String(req.header('Byte-Timestamp') || req.query.timestamp || '');
+    const nonce = String(req.header('Byte-Nonce-Str') || req.query.nonce || '');
+    const signature = String(req.header('Byte-Signature') || '');
 
-    let msgData: { cp_orderno?: string; payment_status?: number };
-    try {
-      msgData = JSON.parse(msg);
-    } catch {
-      return res.json({ err_no: -1, err_tips: '娑堟伅瑙ｆ瀽澶辫触' });
-    }
-
-    const outOrderNo = msgData.cp_orderno;
-    const paymentStatus = msgData.payment_status;
-    if (outOrderNo && paymentStatus === 2) {
-      db.prepare('UPDATE orders SET status = ?, paid_at = datetime(\'now\') WHERE out_order_no = ?').run('paid', outOrderNo);
-      const order = db.prepare('SELECT user_id FROM orders WHERE out_order_no = ?').get(outOrderNo) as { user_id: string } | null;
-      if (order?.user_id) {
-      db.prepare('UPDATE users SET is_vip = 1, updated_at = datetime(\'now\') WHERE id = ?').run(order.user_id);
+    if (DOUYIN_PLATFORM_PUBLIC_KEY) {
+      try {
+        const verified = verifyPaymentCallbackSignature(rawBody, timestamp, nonce, signature);
+        if (!verified) {
+          return res.status(400).json({ err_no: 1, err_tips: 'invalid signature' });
+        }
+      } catch (error) {
+        return res.status(400).json({ err_no: 1, err_tips: 'invalid signature' });
       }
     }
-    return res.json({ err_no: 0 });
+
+    const callbackType = typeof req.body?.type === 'string' ? req.body.type : '';
+    const version = typeof req.body?.version === 'string' ? req.body.version : '';
+    const msg = req.body?.msg;
+
+    if (callbackType === 'payment' && version === '3.0' && typeof msg === 'string') {
+      let msgData: {
+        app_id?: string;
+        out_order_no?: string;
+        order_id?: string;
+        status?: string;
+        total_amount?: number;
+      };
+      try {
+        msgData = JSON.parse(msg);
+      } catch {
+        return res.status(400).json({ err_no: 1, err_tips: 'invalid msg' });
+      }
+
+      const outOrderNo = msgData.out_order_no || '';
+      if (outOrderNo) {
+        const purchaseRecord = db.prepare(
+          'SELECT user_id, product_id FROM purchase_records WHERE custom_id = ? ORDER BY id DESC LIMIT 1'
+        ).get(outOrderNo) as { user_id: string; product_id: string } | null;
+        const product = (purchaseRecord && getProductById(purchaseRecord.product_id)) || getProductByCustomId(outOrderNo);
+
+        if (msgData.status === 'SUCCESS') {
+          if (purchaseRecord && product) {
+            fulfillPurchaseRecord(db, {
+              userId: purchaseRecord.user_id,
+              productId: product.productId,
+              customId: outOrderNo,
+              orderAmount: typeof msgData.total_amount === 'number' ? msgData.total_amount : product.orderAmount,
+              goodName: product.goodName,
+              grantType: product.grantType,
+              paymentResult: msgData,
+              status: 'paid_server_callback'
+            });
+          } else {
+            db.prepare(`
+              INSERT INTO operation_logs (user_id, action, details, created_at)
+              VALUES (?, ?, ?, datetime('now'))
+            `).run(null, 'purchase_callback_unmatched', JSON.stringify(msgData));
+          }
+        }
+      }
+
+      return res.json({ err_no: 0, err_tips: 'success' });
+    }
+
+    const legacyMsg = typeof msg === 'string' ? msg : null;
+    if (legacyMsg) {
+      let msgData: { cp_orderno?: string; payment_status?: number };
+      try {
+        msgData = JSON.parse(legacyMsg);
+      } catch {
+        return res.status(400).json({ err_no: 1, err_tips: 'invalid msg' });
+      }
+      const outOrderNo = msgData.cp_orderno;
+      const paymentStatus = msgData.payment_status;
+      if (outOrderNo && paymentStatus === 2) {
+        db.prepare('UPDATE orders SET status = ?, paid_at = datetime(\'now\') WHERE out_order_no = ?').run('paid', outOrderNo);
+        const order = db.prepare('SELECT user_id FROM orders WHERE out_order_no = ?').get(outOrderNo) as { user_id: string } | null;
+        if (order?.user_id) {
+          db.prepare('UPDATE users SET is_vip = 1, updated_at = datetime(\'now\') WHERE id = ?').run(order.user_id);
+        }
+      }
+      return res.json({ err_no: 0, err_tips: 'success' });
+    }
+
+    return res.status(400).json({ err_no: 1, err_tips: 'unsupported callback payload' });
   });
 
   app.use(express.static(PUBLIC_DIR));
